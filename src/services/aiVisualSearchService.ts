@@ -69,6 +69,7 @@ export interface AiPartAnalysisResult {
   summary: {
     whatYouSee?: string;
     detectedPartType: string;
+    partFamilyFarsi?: string; // short part family, e.g. «چرخ‌دهنده» — used for dynamic UI titles
     detectedProfile: string;
     material?: string;
     visualAnalysis: string;

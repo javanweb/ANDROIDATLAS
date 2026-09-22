@@ -1156,6 +1156,7 @@ ${stageInstruction}
   "objectColor": "black | white_cream | yellow_orange | red | green | metallic_grey | blue | other",
   "detectedCodeOnPart": "کد یا عدد خوانده‌شده از تصویر (در صورت عدم وجود، رشته خالی)",
   "detectedPartType": "نام دقیق فارسی قطعه (مثلاً: پولی تفلون هرزگرد / بوش لاستیکی کوپلینگ خاری / کشنده تسمه)",
+  "partFamilyFarsi": "نام کوتاه خانواده قطعه به فارسی، فقط ۱ تا ۲ کلمه (مثلاً: چرخ‌دهنده، پولی، تسمه، بوش کوپلینگ، رولر، پروانه، برس، دیافراگم)",
   "detectedProfile": "پروفیل یا استاندارد قطعه (مثلاً HTD-8M یا DIN 1000 یا مقطع B)",
   "material": "جنس قطعه (مثلاً تفلون POM / پلی‌یورتان / لاستیک فشرده / آلومینیوم)",
   "visualAnalysis": "تحلیل تخصصی و جامع هندسه، دندانه‌ها، رنگ، مقطع و مشاهدات بصری تصویر",
@@ -1370,7 +1371,9 @@ ${stageInstruction}
           : {
               status: 'custom_order_available',
               statusFarsiTitle: 'عین این قطعه در کاتالوگ فعلی موجود نیست — می‌توانیم برایتان بسازیم',
-              statusFarsiMessage: `هوش مصنوعی عکس شما را از نظر ظاهری با کالاهای کاتالوگ مقایسه کرد و هیچ‌یک انطباق صددرصدی نداشت.${similarCandidates.length > 0 ? ' شبیه‌ترین گزینه‌ها صرفاً به‌عنوان مرجع در پایین نمایش داده می‌شوند (عین قطعه شما نیستند).' : ''} کارگاه تخصصی هایپر صنعت اطلس توانایی ساخت یا تأمین سفارشی همین قطعه را دارد.`,
+              statusFarsiMessage: similarCandidates.length > 0
+                ? `عینِ همین قطعه در کاتالوگ موجود نیست؛ اما شبیه‌ترین ${parsedResult.partFamilyFarsi || 'اقلام'}‌ها در بخش «این ${parsedResult.partFamilyFarsi || 'اقلام'}‌ها را داریم» قابل سفارش هستند. اگر عین همین قطعه را می‌خواهید، کارگاه تخصصی هایپر صنعت اطلس توانایی ساخت یا تأمین سفارشی آن را دارد.`
+                : `هوش مصنوعی عکس شما را از نظر ظاهری با کالاهای کاتالوگ مقایسه کرد و هیچ‌یک انطباق صددرصدی نداشت. کارگاه تخصصی هایپر صنعت اطلس توانایی ساخت یا تأمین سفارشی همین قطعه را دارد.`,
             };
       }
     }
@@ -1397,6 +1400,7 @@ ${stageInstruction}
       summary: {
         whatYouSee: parsedResult.whatYouSee || '',
         detectedPartType: parsedResult.detectedPartType || 'قطعه صنعتی کاتالوگ اطلس',
+        partFamilyFarsi: parsedResult.partFamilyFarsi || '',
         detectedProfile: parsedResult.detectedProfile || 'استاندارد کارخانجات صنعتی',
         material: parsedResult.material || 'متریال صنعتی استاندارد',
         visualAnalysis: parsedResult.visualAnalysis || 'تصویر قطعه با الگوریتم بینایی ماشین بررسی و با کاتالوگ تطبیق داده شد.',
