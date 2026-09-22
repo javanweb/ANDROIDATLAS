@@ -17,6 +17,9 @@ export default defineConfig(() => {
       hmr: process.env.DISABLE_HMR !== 'true',
       // Disable file watching when DISABLE_HMR is true to save CPU during agent edits.
       watch: process.env.DISABLE_HMR === 'true' ? null : {},
+      // Allow the sandbox preview host so the app is reachable in hosted environments.
+      allowedHosts: true as const,
+      host: true,
     },
   };
 });

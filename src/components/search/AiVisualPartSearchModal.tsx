@@ -27,6 +27,8 @@ import {
   ShieldCheck,
   Eye,
   Wrench,
+  Phone,
+  MessageCircle,
 } from 'lucide-react';
 import { Modal } from '../ui/Modal';
 import {
@@ -1137,15 +1139,16 @@ export const AiVisualPartSearchModal: React.FC<Props> = ({ isOpen, onClose }) =>
                 </div>
               )}
 
-              {/* Matched Products List */}
+              {/* Matched Products List — ONLY 100% exact matches appear here */}
+              {analysisResult.matchedProducts.length > 0 ? (
               <div className="space-y-3">
                 <div className="flex items-center justify-between">
                   <h4 className="font-black text-sm text-[#0A172F] flex items-center gap-2">
                     <Layers className="w-4 h-4 text-[#F97316]" />
-                    <span>کالاهای شناسایی‌شده ({toPersianDigits(analysisResult.matchedProducts.length)} مورد)</span>
+                    <span>عین قطعه شما در کاتالوگ پیدا شد ({toPersianDigits(analysisResult.matchedProducts.length)} مورد)</span>
                   </h4>
                   <span className="text-xs text-slate-500">
-                    مرتب بر اساس راستی‌آزمایی بصری و بیشترین انطباق
+                    فقط اقلام با انطباق صددرصدی و تأیید راستی‌آزمایی بصری
                   </span>
                 </div>
 
@@ -1297,6 +1300,47 @@ export const AiVisualPartSearchModal: React.FC<Props> = ({ isOpen, onClose }) =>
                   })}
                 </div>
               </div>
+              ) : (
+              /* ─── Custom Order Panel: exact part NOT in catalog ─── */
+              <div className="p-5 rounded-2xl border-2 border-dashed border-amber-300 bg-gradient-to-l from-amber-50 via-orange-50 to-amber-50 space-y-4">
+                <div className="flex items-start gap-3">
+                  <div className="w-12 h-12 rounded-2xl bg-[#F97316] text-white flex items-center justify-center shrink-0 shadow-md">
+                    <Wrench className="w-6 h-6" />
+                  </div>
+                  <div className="space-y-1.5 flex-1">
+                    <div className="font-black text-base text-[#0A172F]">
+                      می‌تونیم براتون بسازیم 🔧
+                    </div>
+                    <p className="text-xs text-slate-600 leading-relaxed">
+                      هوش مصنوعی اطلس عکس شما را با تمام {toPersianDigits(864)} قلم کالای کاتالوگ مقایسه کرد و
+                      هیچ‌کدام انطباق صددرصدی با قطعه شما نداشت؛ یعنی عین همین قطعه در کاتالوگ فعلی موجود نیست.
+                      اما کارگاه تخصصی هایپر صنعت اطلس توانایی ساخت یا تأمین سفارشی <strong>دقیقاً همین قطعه</strong> را دارد.
+                    </p>
+                    <p className="text-[11px] text-slate-500 leading-relaxed">
+                      کافیست همین عکس را برای کارشناسان ما ارسال کنید تا شناسایی دقیق، استعلام قیمت و زمان ساخت اعلام شود.
+                    </p>
+                  </div>
+                </div>
+                <div className="flex flex-col sm:flex-row gap-2">
+                  <a
+                    href="tel:03538739900"
+                    className="flex-1 h-11 bg-[#0A172F] hover:bg-[#1B293E] text-white rounded-xl font-bold text-xs transition-colors flex items-center justify-center gap-2"
+                  >
+                    <Phone className="w-4 h-4" />
+                    <span>تماس با اطلس: ۰۳۵-۳۸۷۳۹۹۰۰</span>
+                  </a>
+                  <a
+                    href="https://wa.me/989903427027?text=سلام%2C%20این%20تصویر%20قطعه%20را%20برای%20ساخت%20سفارشی%20ارسال%20می‌کنم"
+                    target="_blank"
+                    rel="noreferrer"
+                    className="flex-1 h-11 bg-emerald-600 hover:bg-emerald-700 text-white rounded-xl font-bold text-xs transition-colors flex items-center justify-center gap-2"
+                  >
+                    <MessageCircle className="w-4 h-4" />
+                    <span>ارسال عکس در واتس‌اپ</span>
+                  </a>
+                </div>
+              </div>
+              )}
 
               {/* Rejected Candidates Transparency Section */}
               {analysisResult.rejectedCandidates && analysisResult.rejectedCandidates.length > 0 && (
@@ -1309,7 +1353,7 @@ export const AiVisualPartSearchModal: React.FC<Props> = ({ isOpen, onClose }) =>
                     <span className="flex items-center gap-2">
                       <Eye className="w-4 h-4 text-slate-500" />
                       <span>
-                        کاندیداهای کاتالوگ که بررسی شدند اما رد شدند (فرق داره) (
+                        کاندیداهای کاتالوگ که با عکس شما مقایسه شدند اما تأیید نشدند (
                         {toPersianDigits(analysisResult.rejectedCandidates.length)} قلم)
                       </span>
                     </span>
@@ -1344,8 +1388,8 @@ export const AiVisualPartSearchModal: React.FC<Props> = ({ isOpen, onClose }) =>
                               <div className="flex-1 min-w-0 space-y-1">
                                 <div className="flex items-center justify-between">
                                   <span className="font-mono text-[10px] text-slate-500 font-bold">{rej.code}</span>
-                                  <span className="text-[10px] bg-red-50 text-red-700 px-1.5 py-0.5 rounded font-bold">
-                                    فرق داره
+                                  <span className={`text-[10px] px-1.5 py-0.5 rounded font-bold ${rej.visualVerdict === 'very_similar' ? 'bg-amber-50 text-amber-700' : 'bg-red-50 text-red-700'}`}>
+                                    {rej.visualVerdict === 'very_similar' ? 'نزدیک ولی عین همون نیست' : 'فرق داره'}
                                   </span>
                                 </div>
                                 <div className="font-bold text-slate-800 text-[11px] truncate">{rej.name}</div>

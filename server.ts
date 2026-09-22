@@ -85,12 +85,14 @@ async function generateWithModelCascade(
   ai: GoogleGenAI,
   contents: any[],
   config?: any,
-  tag = 'AI Search'
+  tag = 'AI Search',
+  models: string[] = GEMINI_MODELS,
+  timeoutMs = 15000
 ): Promise<{ text: string; model: string }> {
   let lastError = '';
-  for (const model of GEMINI_MODELS) {
+  for (const model of models) {
     try {
-      const text = await callGeminiModelWithTimeout(ai, model, contents, config, 15000);
+      const text = await callGeminiModelWithTimeout(ai, model, contents, config, timeoutMs);
       if (text && text.trim()) {
         return { text, model };
       }
@@ -155,6 +157,52 @@ const CATALOG_IMAGES_DIR = path.join(process.cwd(), 'src', 'assets', 'imagesprod
 const IMAGE_HASH_INDEX = new Map<string, string>();
 let visualIndexReady = false;
 
+// ----------------------------------------------------------------------------
+// Catalog image filename resolver.
+// The catalog data references images like "e(001).png" while the file on disk
+// may be stored as "e(1).png" (zero-padding differences). Without this
+// resolver, ~99 products were invisible to the hash index and to AI
+// side-by-side verification.
+// ----------------------------------------------------------------------------
+const CATALOG_IMAGE_ALIASES = new Map<string, string>();
+
+function buildCatalogImageAliases(): void {
+  try {
+    const files = fs.readdirSync(CATALOG_IMAGES_DIR);
+    for (const f of files) {
+      const lower = f.toLowerCase();
+      CATALOG_IMAGE_ALIASES.set(lower, f);
+      const m = lower.match(/^e\(?(\d+)\)?\.(png|jpe?g|webp)$/i);
+      if (m) {
+        const num = parseInt(m[1], 10);
+        const ext = m[2];
+        for (const pad of [2, 3]) {
+          const variant = `e(${String(num).padStart(pad, '0')}).${ext}`;
+          if (!CATALOG_IMAGE_ALIASES.has(variant)) {
+            CATALOG_IMAGE_ALIASES.set(variant, f);
+          }
+        }
+      }
+    }
+    console.log(`[Server] Catalog image alias map: ${CATALOG_IMAGE_ALIASES.size} entries.`);
+  } catch {
+    // best-effort only
+  }
+}
+
+function resolveCatalogImagePath(image?: string): string | null {
+  const clean = (image || '').trim().toLowerCase();
+  if (!clean) return null;
+  const direct = path.join(CATALOG_IMAGES_DIR, clean);
+  if (fs.existsSync(direct)) return direct;
+  const aliased = CATALOG_IMAGE_ALIASES.get(clean);
+  if (aliased) {
+    const p = path.join(CATALOG_IMAGES_DIR, aliased);
+    if (fs.existsSync(p)) return p;
+  }
+  return null;
+}
+
 async function computeDHash(buffer: Buffer): Promise<string> {
   // 17x16 grayscale -> 16x16 = 256 bits
   const raw = await sharp(buffer).resize(17, 16, { fit: 'fill' }).grayscale().raw().toBuffer();
@@ -186,6 +234,8 @@ function hammingDistance(h1: string, h2: string): number {
 
 async function buildImageHashIndex(): Promise<void> {
   try {
+    buildCatalogImageAliases();
+
     // 1) Try loading cache
     if (fs.existsSync(IMAGE_HASH_CACHE_PATH)) {
       try {
@@ -210,8 +260,8 @@ async function buildImageHashIndex(): Promise<void> {
     for (const item of CATALOG_ITEMS) {
       const file = (item.image || '').trim();
       if (!file || IMAGE_HASH_INDEX.has(file)) continue;
-      const fullPath = path.join(CATALOG_IMAGES_DIR, file);
-      if (!fs.existsSync(fullPath)) continue;
+      const fullPath = resolveCatalogImagePath(file);
+      if (!fullPath) continue;
       try {
         const buf = fs.readFileSync(fullPath);
         IMAGE_HASH_INDEX.set(file, await computeDHash(buf));
@@ -489,6 +539,33 @@ async function searchByImage(imageBuffer: Buffer, topK = 4): Promise<VisualMatch
   return res.candidates.filter(r => r.visualDistance <= VISUAL_SIMILAR_MAX);
 }
 
+// ----------------------------------------------------------------------------
+// Stamped-code identification: if the AI can read a code/number printed on the
+// physical part (e.g. "1000 0 1" on a FORZA coupling bush) and that code maps
+// to exactly one catalog item, that is the strongest possible identity signal.
+// ----------------------------------------------------------------------------
+function normalizeStampCode(s: string): string {
+  return (s || '')
+    .toLowerCase()
+    .replace(/forzacode\s*:?/gi, '')
+    .replace(/[\s\-_/.:؛,،()[\]]+/g, '');
+}
+
+function findCatalogItemsByStampedCode(detectedCode: string): CatalogItem[] {
+  const clean = normalizeStampCode(detectedCode);
+  if (!clean || clean.length < 4) return [];
+  const hits: CatalogItem[] = [];
+  for (const item of CATALOG_ITEMS) {
+    const forzaNorm = normalizeStampCode(item.forzaCode || '');
+    const codeNorm = normalizeStampCode(item.code || '');
+    // exact equality, or the stamped number is exactly the numeric part of the FORZA code
+    if (codeNorm === clean || (forzaNorm && forzaNorm === clean)) {
+      hits.push(item);
+    }
+  }
+  return hits;
+}
+
 // Intelligent matching against the 864 catalog products
 function searchCatalogProducts(params: {
   partType?: string;
@@ -746,16 +823,6 @@ async function normalizeImageInput(
   }
 }
 
-// Merge exact/near-duplicate visual matches ahead of keyword matches (dedupe by code)
-function mergeVisualMatches<T extends { code: string }>(keywordMatches: T[], visualMatches: VisualMatch[]) {
-  const seen = new Set(visualMatches.map(v => v.code.toLowerCase()));
-  const rest = keywordMatches.filter(m => !seen.has(m.code.toLowerCase()));
-  const merged = [...visualMatches, ...rest].slice(0, 4);
-  const exactVisualMatch =
-    visualMatches.length > 0 && visualMatches[0].visualDistance <= VISUAL_EXACT_MAX;
-  return { merged, exactVisualMatch };
-}
-
 // Strip markdown code fences (```json ... ```) that models sometimes wrap around JSON
 function stripJsonFences(text: string): string {
   return text
@@ -781,137 +848,233 @@ interface VisualVerificationResponse {
   };
 }
 
-// Side-by-side visual comparison between real-world photo and official catalog photos
+// Verification model cascade: accuracy-critical step, prefer the strongest
+// vision models before falling back to lighter ones.
+const VERIFICATION_MODELS = [
+  'gemini-3.5-flash',
+  'gemini-flash-latest',
+  'gemini-3.8-flash',
+  'gemini-3.5-flash-lite',
+  'gemini-flash-lite-latest',
+  'gemini-3.1-flash-lite',
+];
+
+// Verify ONE candidate against the user's photo in its own isolated AI call.
+// Isolated single-pair comparison eliminates the image/code mix-ups that
+// happen when several candidate images share one prompt.
+async function verifySingleCandidate(
+  ai: GoogleGenAI,
+  userJpg: Buffer,
+  candJpg: Buffer,
+  cand: any,
+  whatYouSee: string
+): Promise<VisualVerificationVerdict | null> {
+  const parts: any[] = [
+    {
+      text: `تصویر شماره ۱: عکس واقعی ارسالی کاربر از یک قطعه صنعتی (ممکن است روی دستگاه یا در کارگاه باشد).
+توضیح آنچه کاربر فرستاده: ${whatYouSee || 'قطعه صنعتی'}
+
+تصویر شماره ۲: عکس رسمی یک کالای کاتالوگ هایپر صنعت اطلس — کد ${cand.code} (${cand.forzaCode || ''}) — نام کالا: «${cand.name}»
+
+شما سیستم راستی‌آزمایی بصری تخصصی اطلس هستید. سیاست ما «تطابق صددرصدی» است:
+- "exact_match": فقط وقتی که در تصویر ۲ «عیناً همان قطعه فیزیکی» تصویر ۱ است؛ فرم هندسی، تعداد و الگوی دندانه/شیار/پره/سوراخ، نسبت‌های ابعادی و جزئیات ساختاری کاملاً منطبق (زاویه دوربین، نور و پس‌زمینه ممکن است فرق کند، ولی خود جسم یکی است). اگر عدد یا کدی روی قطعه در تصویر ۱ خوانده می‌شود و با کد این کالا یکسان است، قوی‌ترین مدرک exact_match است.
+- "very_similar": هم‌خانواده و نزدیک است ولی عین همان قطعه نیست (اختلاف در تعداد دندانه/پره، قطر، طول، عرض یا جزئیات ساختاری).
+- "different": از نظر ظاهری و ساختاری اصلاً همان قطعه نیست.
+
+قوانین حیاتی:
+(۱) فقط بر اساس مقایسه بصری این دو تصویر قضاوت کن؛ نام و توضیحات کاتالوگ ملاک نیست.
+(۲) شک داری = exact_match نده! هرگز به صرف هم‌خانواده بودن یا کاربرد مشابه، exact_match نده.
+(۳) اختلاف ابعادی یعنی exact_match نیست.
+
+پاسخ صرفاً JSON معتبر:
+{
+  "verdict": "exact_match" | "very_similar" | "different",
+  "visualExplanation": "توضیح چشمی کوتاه به فارسی: چه چیزهایی دقیقاً منطبق‌اند یا چه فرقی دارند",
+  "matchScore": عدد بین ۰ تا ۹۹ (exact_match: ۹۰ تا ۹۹، very_similar: ۶۰ تا ۸۷، different: زیر ۵۰)
+}`,
+    },
+    { inlineData: { mimeType: 'image/jpeg', data: userJpg.toString('base64') } },
+    { inlineData: { mimeType: 'image/jpeg', data: candJpg.toString('base64') } },
+  ];
+
+  try {
+    const { text, model } = await generateWithModelCascade(
+      ai,
+      [{ role: 'user', parts }],
+      { responseMimeType: 'application/json' },
+      `Visual Verify ${cand.code}`,
+      VERIFICATION_MODELS,
+      25000
+    );
+    const parsed = JSON.parse(stripJsonFences(text));
+    const verdict = parsed?.verdict;
+    if (verdict === 'exact_match' || verdict === 'very_similar' || verdict === 'different') {
+      return {
+        candidateCode: cand.code,
+        verdict,
+        visualExplanation: parsed.visualExplanation || '',
+        matchScore: Math.min(Math.max(Math.round(parsed.matchScore || 50), 0), 99),
+      };
+    }
+    return null;
+  } catch (err: any) {
+    console.log(`[Visual Verify ${cand.code}] failed: ${err?.message?.slice(0, 80)}`);
+    return null;
+  }
+}
+
+// Second opinion: an independent fresh look at a claimed exact match.
+// If the second opinion disagrees, the candidate is downgraded — we only
+// keep exact matches that survive both checks.
+async function confirmExactMatch(
+  ai: GoogleGenAI,
+  userJpg: Buffer,
+  candJpg: Buffer,
+  stampedCodeHint?: string
+): Promise<boolean> {
+  const hint = stampedCodeHint
+    ? `
+نکته مهم: روی خود قطعه در تصویر ۱ این کد/عدد خوانده شده است: «${stampedCodeHint}». اگر این کد با کد کاتالوگ این کالا یکی است، این قوی‌ترین مدرک یکسان بودن مدل قطعه است — اما همچنان فرم ظاهری دو تصویر باید یک خانواده و منطبق باشد.`
+    : '';
+  const parts: any[] = [
+    {
+      text: `دو تصویر از قطعات صنعتی دارید: تصویر ۱ عکس واقعی کاربر، تصویر ۲ عکس رسمی یک کالای کاتالوگ.
+آیا جسم فیزیکی در تصویر ۲ دقیقاً همان مدل قطعه در تصویر ۱ است؟ (همان فرم هندسی، همان تعداد دندانه/پره/شیار/سوراخ، همان نسبت‌های ابعادی — فقط زاویه/نور/پس‌زمینه متفاوت است)${hint}
+سخت‌گیر باش: اگر اندازه، تعداد دندانه/پره، ساختار یا جزئیات فرق دارد، جواب false است. اگر مطمئن نیستی، جواب false است.
+پاسخ صرفاً JSON: {"samePhysicalPart": true/false, "reason": "دلیل کوتاه فارسی"}`,
+    },
+    { inlineData: { mimeType: 'image/jpeg', data: userJpg.toString('base64') } },
+    { inlineData: { mimeType: 'image/jpeg', data: candJpg.toString('base64') } },
+  ];
+
+  try {
+    const { text } = await generateWithModelCascade(
+      ai,
+      [{ role: 'user', parts }],
+      { responseMimeType: 'application/json' },
+      'Exact Confirm',
+      VERIFICATION_MODELS,
+      25000
+    );
+    const parsed = JSON.parse(stripJsonFences(text));
+    return parsed?.samePhysicalPart === true;
+  } catch {
+    return false;
+  }
+}
+
+// Side-by-side visual comparison between real-world photo and official catalog photos.
+// Verifies up to 8 candidates, each in its own parallel AI call, then double-checks
+// every claimed exact match with an independent second opinion.
 async function verifyCandidatesVisually(
   ai: GoogleGenAI,
   userImageBuffer: Buffer,
   userImageMime: string,
   candidates: any[],
   whatYouSee: string,
-  detectedPartType: string
+  detectedPartType: string,
+  stampedCodeText?: string,
+  stampedCodeItemCodes?: Set<string>
 ): Promise<VisualVerificationResponse | null> {
   if (!candidates || candidates.length === 0) return null;
 
   try {
-    // 1. Prepare user image resized to max 400x400 JPEG for high speed and precision
+    // 1. Prepare user image resized to max 480x480 JPEG
     const userJpg = await sharp(userImageBuffer)
-      .resize(400, 400, { fit: 'inside' })
-      .jpeg({ quality: 80 })
+      .resize(480, 480, { fit: 'inside' })
+      .jpeg({ quality: 85 })
       .toBuffer();
 
-    // 2. Prepare candidate images (up to 4 candidates)
-    const activeCandidates = candidates.slice(0, 4);
-    const candidateParts: any[] = [];
-    const validCodes: string[] = [];
+    // 2. Deduplicate candidates by code and cap at 8
+    const seenCodes = new Set<string>();
+    const uniqueCandidates = candidates.filter(c => {
+      const key = (c.code || '').toLowerCase();
+      if (!key || seenCodes.has(key)) return false;
+      seenCodes.add(key);
+      return true;
+    }).slice(0, 8);
 
-    for (let i = 0; i < activeCandidates.length; i++) {
-      const cand = activeCandidates[i];
-      const imgPath = path.join(CATALOG_IMAGES_DIR, cand.image);
-      if (fs.existsSync(imgPath)) {
-        try {
-          const candJpg = await sharp(imgPath)
-            .resize(320, 320, { fit: 'inside' })
-            .jpeg({ quality: 75 })
-            .toBuffer();
-
-          validCodes.push(cand.code);
-          candidateParts.push({
-            text: `کاندیدای شماره ${i + 1} از کاتالوگ رسمی هایپر صنعت اطلس: کد ${cand.code} (${cand.forzaCode || ''}) - نام کالا: «${cand.name}» - دسته‌بندی: ${cand.categoryName} / ${cand.subcategory}`,
-          });
-          candidateParts.push({
-            inlineData: {
-              mimeType: 'image/jpeg',
-              data: candJpg.toString('base64'),
-            },
-          });
-        } catch (e) {
-          console.warn(`[Visual Verification] Sharp resize failed for ${cand.code}:`, e);
-        }
+    // 3. Load + resize candidate images (aliases resolved)
+    const prepared: { cand: any; jpg: Buffer }[] = [];
+    for (const cand of uniqueCandidates) {
+      const imgPath = resolveCatalogImagePath(cand.image);
+      if (!imgPath) continue;
+      try {
+        const candJpg = await sharp(imgPath)
+          .resize(440, 440, { fit: 'inside' })
+          .jpeg({ quality: 82 })
+          .toBuffer();
+        prepared.push({ cand, jpg: candJpg });
+      } catch (e) {
+        console.warn(`[Visual Verification] Sharp resize failed for ${cand.code}:`, e);
       }
     }
+    if (prepared.length === 0) return null;
 
-    if (candidateParts.length === 0) return null;
+    console.log(`[Visual Verification] Verifying ${prepared.length} candidates one-by-one (concurrency-limited)...`);
 
-    const parts: any[] = [
-      {
-        text: `تصویر ارسالی کاربر (عکس دنیای واقعی از قطعه روی دستگاه یا در کارگاه صنعتی):\nتوضیح آنچه در تصویر کاربر دیده می‌شود: ${whatYouSee || detectedPartType}`,
-      },
-      {
-        inlineData: {
-          mimeType: 'image/jpeg',
-          data: userJpg.toString('base64'),
-        },
-      },
-      ...candidateParts,
-      {
-        text: `
-شما سیستم بینایی ماشین و راستی‌آزمایی بصری تخصصی هایپر صنعت اطلس هستید.
-دستور صریح و بسیار مهم:
-شما نباید بر اساس عنوان، متن یا توضیحات کاتالوگ تصمیم بگیرید!
-بلکه باید دقیقاً بر اساس «همان ظاهر فیزیکی محصول در عکس کاربر» (فرم هندسی، دندانه، شیار، سوراخ، رنگ و اتصالات) بررسی کنید که آیا در کاتالوگ محصولات این چنین عکسی تطابق دارد یا خیر.
-
-نکته درباره عکس‌ها:
-عکس کاربر عکس واقعی از قطعه است (ممکن است روی کانوایر یا ماشین باشد، یا زاویه دید متفاوتی داشته باشد). تصاویر کاندیداها، عکس‌های واقعی کاتالوگ هستند.
-تک‌تک کاندیداها (${validCodes.join(', ')}) را صرفاً از روی مقایسه تصویر کاندیدا با تصویر کاربر ارزیابی کن:
-
-برای هر کاندید:
-۱. candidateCode: کد دقیق کالا (مثلاً "${validCodes[0]}")
-۲. verdict: دقیقاً یکی از ۳ وضعیت:
-   - "exact_match": همونه (انطباق مستقیم ظاهر و عکس محصول در کاتالوگ با عکس کاربر؛ شکل فیزیکی، فرم و مکانیزم دقیقاً منطبق است).
-   - "very_similar": شبیهه (مدل مشابه استاندارد کاتالوگ؛ ساختار و فرم بصری بسیار نزدیک و هم‌خانواده است ولی در ابعاد یا تعداد شیار جزئیات اندکی فرق دارد).
-   - "different": فرق داره (ظاهر تصویر با عکس کاربر تطابق ندارد و فرم فیزیکی کاملاً متفاوتی دارد؛ مثلاً عکس کاربر پولی یا بوش است ولی کاندیدا تسمه یا چرخ‌دنده است).
-۳. visualExplanation: توضیح دقیق و چشمی به زبان فارسی درباره مقایسه عکس کاربر با عکس کاتالوگ این کالا (بگو کدام ویژگی‌های ظاهری در عکس‌ها عیناً منطبق هستند یا چه فرقی دارند).
-۴. matchScore: نمره انطباق بصری بین ۸۸ تا ۹۹ برای exact_match، بین ۷۰ تا ۸۷ برای very_similar، و زیر ۵۰ برای different.
-
-سپس وضعیت موجودی تطابق بصری در کاتالوگ (catalogAvailability):
-- status:
-  * "confirmed_in_catalog": اگر عکس کاندیدا انطباق مستقیم یا شباهت بسیار بالا دارد.
-  * "similar_in_catalog": اگر مدل مشابه استاندارد در تصاویر کاتالوگ یافت شد.
-  * "custom_order_available": اگر هیچ‌کدام از تصاویر کاتالوگ تطابق بصری کافی نداشتند.
-- statusFarsiTitle: عنوان فارسی اطمینان‌بخش
-- statusFarsiMessage: پیام توصیفی به زبان فارسی
-
-قوانین حیاتی:
-(۱) قضاوت فقط و فقط بر مبنای مقایسه بصری دو عکس است، نه اسم یا توضیحات.
-(۲) کالاهایی با ظاهر متفاوت ("different") را تایید نکنید.
-
-پاسخ را صرفاً به صورت JSON معتبر با ساختار زیر بدهید:
-{
-  "candidateVerdicts": [
-    {
-      "candidateCode": "کد_کالا",
-      "verdict": "exact_match" | "very_similar" | "different",
-      "visualExplanation": "توضیح مقایسه چشمی دو تصویر به فارسی",
-      "matchScore": 95
-    }
-  ],
-  "catalogAvailability": {
-    "status": "confirmed_in_catalog" | "similar_in_catalog" | "custom_order_available",
-    "statusFarsiTitle": "عنوان فارسی",
-    "statusFarsiMessage": "پیام توصیفی به فارسی"
-  }
-}
-`,
-      },
-    ];
-
-    try {
-      const { text: respText, model: usedModel } = await generateWithModelCascade(
-        ai,
-        [{ role: 'user', parts }],
-        { responseMimeType: 'application/json' },
-        'Visual Verification'
+    // 4. First pass: isolated verification of every candidate.
+    //    Concurrency is limited (3 at a time, staggered) to avoid API rate
+    //    limits (429) that would force fallbacks to weaker models.
+    const verdicts: VisualVerificationVerdict[] = [];
+    const CONCURRENCY = 3;
+    for (let i = 0; i < prepared.length; i += CONCURRENCY) {
+      const chunk = prepared.slice(i, i + CONCURRENCY);
+      const chunkResults = await Promise.all(
+        chunk.map(async ({ cand, jpg }, j) => {
+          if (j > 0) await new Promise(r => setTimeout(r, j * 350));
+          return verifySingleCandidate(ai, userJpg, jpg, cand, whatYouSee || detectedPartType || '');
+        })
       );
-      if (respText) {
-        const parsed = JSON.parse(stripJsonFences(respText));
-        if (parsed && Array.isArray(parsed.candidateVerdicts)) {
-          console.log(`[Visual Verification] Success with model ${usedModel}: ${parsed.candidateVerdicts.length} candidates verified`);
-          return parsed;
-        }
+      for (const v of chunkResults) {
+        if (v) verdicts.push(v);
       }
-    } catch (err: any) {
-      console.log('[Visual Verification] Model cascade notice:', err?.message);
     }
+    if (verdicts.length === 0) return null;
+
+    // 5. Second pass: independent confirmation of every claimed exact match
+    const exactVerdicts = verdicts.filter(v => v.verdict === 'exact_match');
+    const confirmed: { v: VisualVerificationVerdict; ok: boolean }[] = [];
+    for (let i = 0; i < exactVerdicts.length; i++) {
+      const v = exactVerdicts[i];
+      const p = prepared.find(x => x.cand.code === v.candidateCode);
+      if (!p) {
+        confirmed.push({ v, ok: false });
+        continue;
+      }
+      const hintForCandidate =
+        stampedCodeText && stampedCodeItemCodes?.has((v.candidateCode || '').toLowerCase())
+          ? stampedCodeText
+          : undefined;
+      const ok = await confirmExactMatch(ai, userJpg, p.jpg, hintForCandidate);
+      confirmed.push({ v, ok });
+    }
+
+    for (const { v, ok } of confirmed) {
+      if (!ok) {
+        console.log(`[Visual Verification] Second opinion REJECTED exact claim for ${v.candidateCode} — downgraded to very_similar`);
+        v.verdict = 'very_similar';
+        v.matchScore = Math.min(v.matchScore, 87);
+        v.visualExplanation = v.visualExplanation
+          ? `${v.visualExplanation} (راستی‌آزمایی دوم، قطعیت انطباق را تأیید نکرد — به‌عنوان مشابه دسته‌بندی شد)`
+          : 'راستی‌آزمایی دوم، قطعیت انطباق را تأیید نکرد — به‌عنوان مشابه دسته‌بندی شد';
+      }
+    }
+
+    const hasExact = verdicts.some(v => v.verdict === 'exact_match');
+    const availability = {
+      status: (hasExact ? 'confirmed_in_catalog' : 'custom_order_available') as
+        'confirmed_in_catalog' | 'similar_in_catalog' | 'custom_order_available',
+      statusFarsiTitle: hasExact
+        ? 'تأیید شد: عین همین قطعه در کاتالوگ اطلس موجود است'
+        : 'عین این قطعه در کاتالوگ فعلی موجود نیست — می‌توانیم برایتان بسازیم',
+      statusFarsiMessage: hasExact
+        ? 'راستی‌آزمایی تصویری مستقیم هوش مصنوعی تأیید کرد که این کالا در کاتالوگ اطلس موجود و آماده سفارش است.'
+        : 'هیچ‌کدام از تصاویر کاتالوگ انطباق صددرصدی با عکس شما نداشت؛ کارگاه تخصصی هایپر صنعت اطلس توانایی ساخت یا تأمین سفارشی همین قطعه را دارد.',
+    };
+
+    console.log(`[Visual Verification] Done: ${verdicts.filter(v => v.verdict === 'exact_match').length} exact, ${verdicts.filter(v => v.verdict === 'very_similar').length} similar, ${verdicts.filter(v => v.verdict === 'different').length} different`);
+    return { candidateVerdicts: verdicts, catalogAvailability: availability };
   } catch (err: any) {
     console.error('[Visual Verification] Process error:', err);
   }
@@ -965,56 +1128,56 @@ app.post('/api/ai/analyze-part', async (req, res) => {
 
     // If no API key, return algorithmic visual-first matching across the 864 products
     if (!apiKey) {
-      let noKeyCandidates: any[];
-      let noKeyExact = false;
+      // STRICT 100% POLICY (offline mode, no AI key):
+      // Without Gemini we can only trust the perceptual-hash EXACT duplicate
+      // detector (user re-uploaded a catalog image). Anything looser than an
+      // exact hash hit is NOT proven to be the same part -> custom order.
+      const exactHashMatches = (visualCandidateResult.candidates || []).filter(
+        c => c.visualDistance <= VISUAL_EXACT_MAX
+      );
+      const noKeyExact = exactHashMatches.length > 0;
 
-      if (normalizedImage && visualCandidateResult.candidates.length > 0) {
-        noKeyCandidates = visualCandidateResult.candidates;
-        noKeyExact = visualCandidateResult.exactVisualMatch;
-      } else {
-        noKeyCandidates = searchCatalogProducts({
-          partType: application || '',
-          length: numLength,
-          width: numWidth,
-          pitch: numPitch,
-          application,
-          features,
-        });
-      }
-
-      const noKeySignals =
-        (numLength ? 1 : 0) + (numWidth ? 1 : 0) + (numPitch ? 1 : 0) +
-        (application ? 1 : 0) + (features ? 1 : 0);
-
-      const mappedNoKey = noKeyCandidates.map((m, idx) => ({
+      const mappedNoKey = exactHashMatches.map(m => ({
         ...m,
-        distinction: idx === 1 ? 'گزینه مکمل با ویژگی فنی ویژه' : 'کالای اصلی با بیشترین تطابق تصویری در کاتالوگ',
-        visualVerdict: noKeyExact && idx === 0 ? 'exact_match' : 'very_similar',
-        visualVerdictFarsi: noKeyExact && idx === 0 ? 'همونه (انطباق مستقیم قطعی)' : 'شبیهه (مدل مشابه استاندارد)',
-        visualExplanation: noKeyExact && idx === 0
-          ? 'تصویر ارسالی شما عیناً با تصویر این کالا در کاتالوگ هایپر صنعت اطلس مطابقت دارد.'
-          : 'فرم هندسی و ویژگی‌های ظاهری این قطعه در کاتالوگ بیشترین همخوانی را با تصویر ارسالی دارد.',
+        distinction: 'عیناً همان تصویر کاتالوگ',
+        visualVerdict: 'exact_match' as const,
+        visualVerdictFarsi: 'همونه (انطباق مستقیم قطعی)',
+        visualExplanation: 'تصویر ارسالی شما عیناً با تصویر این کالا در کاتالوگ هایپر صنعت اطلس مطابقت دارد.',
       }));
 
       return res.json({
         success: true,
         isAiGenerated: false,
         stage: reqStage,
-        fallbackNotice: 'کلید هوش مصنوعی (GEMINI_API_KEY) در فایل .env تنظیم نشده است؛ نتیجه با موتور تطبیق مهندسی اطلس تولید شد.',
+        fallbackNotice: noKeyExact
+          ? undefined
+          : 'کلید هوش مصنوعی (GEMINI_API_KEY) تنظیم نشده است؛ فقط تطابق تصویری دقیق (عین عکس کاتالوگ) قابل تأیید بود و عین این قطعه در کاتالوگ یافت نشد. برای تحلیل هوشمند عکس دنیای واقعی، کلید را در فایل .env تنظیم کنید.',
         summary: {
-          detectedPartType: noKeyExact ? mappedNoKey[0].name : 'تسمه و قطعه صنعتی خطوط تولید',
+          detectedPartType: noKeyExact ? mappedNoKey[0].name : 'قطعه صنعتی خطوط تولید',
           detectedProfile: noKeyExact
             ? `عیناً همین کالا در سایت موجود است (${mappedNoKey[0].code})`
             : numLength
               ? `انطباق با ابعاد ${numLength}×${numWidth || 50}mm`
-              : 'استاندارد کاتالوگ بازرگانی اطلس',
+              : 'قطعه خارج از کاتالوگ فعلی',
           visualAnalysis: noKeyExact
             ? 'عکس ارسالی شما عیناً با تصویر یکی از کالاهای سایت مطابقت دارد و همان محصول در صدر نتایج نمایش داده شد.'
-            : 'بر اساس بررسی پارامترهای ابعادی و انطباق با جدول ۸۶۴ قلم کالای رسمی کاتالوگ اطلس، مناسب‌ترین اقلام یافت شدند.',
-          confidence: noKeyExact ? 99 : visualMatches.length > 0 ? 85 : Math.min(55 + noKeySignals * 7, 88),
+            : 'موتور تطبیق تصویری آفلاین، عکس شما را با تمام تصاویر کاتالوگ مقایسه کرد و هیچ انطباق قطعی یافت نشد؛ بنابراین عین این قطعه در کاتالوگ فعلی موجود نیست.',
+          confidence: noKeyExact ? 99 : 55,
           exactVisualMatch: noKeyExact,
+          catalogAvailability: noKeyExact
+            ? {
+                status: 'confirmed_in_catalog',
+                statusFarsiTitle: 'تأیید شد: عین همین قطعه در کاتالوگ اطلس موجود است (همونه)',
+                statusFarsiMessage: 'تصویر ارسالی شما عیناً با تصویر این کالا در کاتالوگ مطابقت دارد.',
+              }
+            : {
+                status: 'custom_order_available',
+                statusFarsiTitle: 'عین این قطعه در کاتالوگ فعلی موجود نیست — می‌توانیم برایتان بسازیم',
+                statusFarsiMessage: 'موتور تطبیق تصویری، هیچ انطباق قطعی با کالاهای کاتالوگ پیدا نکرد. کارگاه تخصصی هایپر صنعت اطلس توانایی ساخت یا تأمین سفارشی همین قطعه را دارد.',
+              },
         },
         matchedProducts: mappedNoKey,
+        rejectedCandidates: [],
         technicalAdvice: 'برای تضمین دقت عملکرد، قبل از ثبت سفارش ابعاد و فاصله مراکز پولی را مجدداً اندازه‌گیری نمایید.',
       });
     }
@@ -1123,23 +1286,63 @@ ${stageInstruction}
     // If the user provided an image, RETRIEVE CANDIDATES DIRECTLY BY VISUAL APPEARANCE OF THEIR CATALOG PHOTOS!
     let mergedCandidates: any[] = [];
     let exactVisualMatch = false;
+    let stampedCodeItems: CatalogItem[] = [];
 
     if (normalizedImage) {
+      const detectedStamp = parsedResult.detectedCodeOnPart || parsedResult.suggestedForzaCode || '';
       const visualRes = await rankCatalogItemsByVisualAppearance({
         queryBuffer: normalizedImage.buffer,
         visualShape: parsedResult.visualShape,
         objectColor: parsedResult.objectColor,
-        detectedCode: parsedResult.detectedCodeOnPart || parsedResult.suggestedForzaCode,
+        detectedCode: detectedStamp,
         length: numLength,
         width: numWidth,
         pitch: numPitch,
-        topK: 4,
+        topK: 8,
       });
 
       mergedCandidates = visualRes.candidates;
       exactVisualMatch = visualRes.exactVisualMatch;
+
+      // A code read directly off the physical part is the strongest identity
+      // signal — every catalog item carrying that code is a must-verify
+      // candidate. (Note: catalog data contains some duplicated FORZA codes,
+      // so there can be more than one item per code.)
+      stampedCodeItems = findCatalogItemsByStampedCode(detectedStamp);
+      for (const item of stampedCodeItems.slice(0, 3)) {
+        const itemCodeLower = item.code.toLowerCase();
+        if (!mergedCandidates.some(c => c.code.toLowerCase() === itemCodeLower)) {
+          mergedCandidates.push({
+            code: item.code,
+            name: item.name,
+            forzaCode: item.forzaCode,
+            brand: brandForCatalogItem(item),
+            categorySlug: item.categorySlug,
+            categoryName: item.categoryName,
+            subcategory: item.subcategory,
+            cataloguePage: item.page,
+            image: item.image,
+            similarityScore: 99,
+            matchReason: `🎯 کد خوانده‌شده از روی خود قطعه (${detectedStamp}) با کد رسمی این کالا در کاتالوگ مطابقت دارد`,
+            specs: item.specs && item.specs.length > 0 ? item.specs.slice(0, 4) : [],
+            price: item.price,
+            stock: item.stock,
+            isVisualMatch: true,
+            visualDistance: 999,
+          });
+          console.log(`[AI Search] Injected stamped-code item ${item.code} (code: ${detectedStamp}) into candidates`);
+        }
+      }
+      mergedCandidates = mergedCandidates.slice(0, 8);
+
       console.log(
         `[AI Search] Visual candidate ranking retrieved ${mergedCandidates.length} items (exactMatch=${exactVisualMatch}, bestDist=${visualRes.bestDistance})`
+      );
+      console.log(
+        `[AI Search] stage=${reqStage} model=${usedModel}`,
+        `| codeOnPart="${parsedResult.detectedCodeOnPart || ''}"`,
+        `| shape=${parsedResult.visualShape || '?'}`,
+        `| stampedCodeHits=${stampedCodeItems.length}`
       );
     } else {
       // Fallback to dimensional matching if no image was uploaded
@@ -1167,7 +1370,9 @@ ${stageInstruction}
         normalizedImage.mimeType,
         mergedCandidates,
         parsedResult.whatYouSee || '',
-        parsedResult.detectedPartType || ''
+        parsedResult.detectedPartType || '',
+        (parsedResult.detectedCodeOnPart || parsedResult.suggestedForzaCode || '').trim(),
+        new Set(stampedCodeItems.map(i => i.code.toLowerCase()))
       );
     }
 
@@ -1227,7 +1432,8 @@ ${stageInstruction}
       };
     });
 
-    // If exact visual duplicate was detected by dHash, force top verdict to exact_match
+    // If exact visual duplicate was detected by dHash (the user's photo IS a
+    // catalog image, e.g. a screenshot/re-upload), force top verdict to exact_match
     if (exactVisualMatch && allProcessed.length > 0) {
       allProcessed[0].visualVerdict = 'exact_match';
       allProcessed[0].visualVerdictFarsi = 'همونه (انطباق مستقیم قطعی)';
@@ -1235,48 +1441,58 @@ ${stageInstruction}
       allProcessed[0].verificationConfidence = 99;
     }
 
-    // Separate verified matches ('exact_match' or 'very_similar') from structurally 'different' items
-    const approvedMatches = allProcessed.filter(
-      p => p.visualVerdict === 'exact_match' || p.visualVerdict === 'very_similar'
+    // STRICT 100% POLICY:
+    // Only candidates verified as "exact_match" (the very same physical part)
+    // may be returned as the customer's part. "very_similar" and "different"
+    // are both treated as NOT the same part — they go to the rejected list so
+    // we never hand the customer a lookalike product "out of thin air".
+    const exactMatches = allProcessed.filter(
+      p => p.visualVerdict === 'exact_match' && (p.similarityScore || 0) >= 88
     );
-    const rejectedCandidates = allProcessed.filter(p => p.visualVerdict === 'different');
+    const rejectedCandidates = allProcessed.filter(p => p !== undefined && !exactMatches.includes(p));
 
-    // Sort approved: exact_match first, then score descending
-    approvedMatches.sort((a, b) => {
-      if (a.visualVerdict === 'exact_match' && b.visualVerdict !== 'exact_match') return -1;
-      if (b.visualVerdict === 'exact_match' && a.visualVerdict !== 'exact_match') return 1;
-      return (b.similarityScore || 0) - (a.similarityScore || 0);
-    });
+    // Sort exact matches by score descending
+    exactMatches.sort((a, b) => (b.similarityScore || 0) - (a.similarityScore || 0));
 
     let finalMatches: typeof allProcessed;
     let catalogAvailability: any;
 
-    if (approvedMatches.length > 0) {
-      finalMatches = approvedMatches.slice(0, 4);
-      const hasExact = approvedMatches.some(m => m.visualVerdict === 'exact_match');
-      if (hasExact) {
+    if (exactMatches.length > 0) {
+      // The exact part IS in the catalog: return only the exact matches.
+      finalMatches = exactMatches.slice(0, 4);
+      catalogAvailability = {
+        status: 'confirmed_in_catalog',
+        statusFarsiTitle: 'تأیید شد: عین همین قطعه در کاتالوگ هایپر صنعت اطلس موجود است (همونه)',
+        statusFarsiMessage: 'راستی‌آزمایی تصویری مستقیم هوش مصنوعی تأیید کرد که عکس شما عیناً همین کالا در کاتالوگ اطلس است و آماده سفارش می‌باشد.',
+      };
+    } else {
+      // The exact part is NOT in the catalog: say so honestly.
+      // NO product is returned as "the customer's part" — instead we offer
+      // to manufacture/source it as a custom order.
+      finalMatches = [];
+
+      // Special case: the image does not appear to contain an industrial part at all
+      const aiConfidence = typeof parsedResult.confidence === 'number' ? parsedResult.confidence : 70;
+      const looksLikeNotAPart =
+        aiConfidence < 50 && /صنعتی نیست|قطعه نیست|نامشخص/.test(
+          `${parsedResult.detectedPartType || ''} ${parsedResult.visualAnalysis || ''}`
+        );
+
+      if (looksLikeNotAPart) {
         catalogAvailability = {
-          status: 'confirmed_in_catalog',
-          statusFarsiTitle: 'تأیید شد: این قطعه در کاتالوگ هایپر صنعت اطلس موجود است (همونه)',
-          statusFarsiMessage: 'راستی‌آزمایی تصویری مستقیم هوش مصنوعی تأیید کرد که این کالا در انبار و کاتالوگ اطلس موجود و آماده سفارش است.',
+          status: 'custom_order_available',
+          statusFarsiTitle: 'تصویر ارسالی قطعه صنعتی شناسایی نشد',
+          statusFarsiMessage: 'به نظر می‌رسد تصویر ارسالی یک قطعه صنعتی نیست. لطفاً عکس واضح‌تری از خود قطعه (از نزدیک و روی سطح مشخص) بارگذاری کنید.',
         };
       } else {
-        catalogAvailability = {
-          status: 'similar_in_catalog',
-          statusFarsiTitle: 'مدل مشابه و جایگزین استاندارد در کاتالوگ موجود است (شبیهه)',
-          statusFarsiMessage: 'این قطعه از نظر کارکرد و مکانیزم کاملاً با نمونه شما سازگار است و توسط مهندسین اطلس به عنوان جایگزین استاندارد پیشنهاد می‌شود.',
-        };
+        catalogAvailability = verificationResponse?.catalogAvailability?.status === 'custom_order_available'
+          ? verificationResponse.catalogAvailability
+          : {
+              status: 'custom_order_available',
+              statusFarsiTitle: 'عین این قطعه در کاتالوگ فعلی موجود نیست — می‌توانیم برایتان بسازیم',
+              statusFarsiMessage: `هوش مصنوعی نوع قطعه را «${parsedResult.detectedPartType || 'قطعه صنعتی'}» تشخیص داد و هیچ‌یک از کالاهای کاتالوگ انطباق صددرصدی با عکس شما نداشت. کارگاه تخصصی هایپر صنعت اطلس توانایی ساخت یا تأمین سفارشی همین قطعه را دارد.`,
+            };
       }
-    } else {
-      // If all candidates inspected were different:
-      // We NEVER show completely irrelevant products as "the same", but we DO NOT report "not found" either!
-      // We show the custom order / technical inquiry status with direct manufacturing feasibility.
-      finalMatches = allProcessed.slice(0, 3);
-      catalogAvailability = verificationResponse?.catalogAvailability || {
-        status: 'custom_order_available',
-        statusFarsiTitle: 'قطعه خاص صنعتی — امکان تامین فوری و ساخت سفارشی در هایپر صنعت اطلس',
-        statusFarsiMessage: `هوش مصنوعی نوع قطعه را «${parsedResult.detectedPartType}» تشخیص داد. این قطعه خاص در کاتالوگ استاندارد فعلی موجود نیست، اما کارگاه تخصصی هایپر صنعت اطلس توانایی ساخت یا تامین فوری آن را دارد.`,
-      };
     }
 
     // Validate bounding box (normalized 0..1000) if the model returned one
@@ -1291,7 +1507,7 @@ ${stageInstruction}
       boundingBox = { x_min: bb.x_min, y_min: bb.y_min, x_max: bb.x_max, y_max: bb.y_max };
     }
 
-    const topScore = finalMatches.length > 0 ? finalMatches[0].similarityScore : 90;
+    const topScore = finalMatches.length > 0 ? finalMatches[0].similarityScore : 0;
 
     return res.json({
       success: true,
@@ -1304,34 +1520,30 @@ ${stageInstruction}
         detectedProfile: parsedResult.detectedProfile || 'استاندارد کارخانجات صنعتی',
         material: parsedResult.material || 'متریال صنعتی استاندارد',
         visualAnalysis: parsedResult.visualAnalysis || 'تصویر قطعه با الگوریتم بینایی ماشین بررسی و با کاتالوگ تطبیق داده شد.',
-        confidence: exactVisualMatch ? 99 : topScore || 95,
+        confidence: exactVisualMatch
+          ? 99
+          : finalMatches.length > 0
+            ? topScore || 95
+            : Math.min(Math.max(Math.round(parsedResult.confidence || 70), 40), 92),
         boundingBox,
-        exactVisualMatch,
+        exactVisualMatch: exactVisualMatch || finalMatches.length > 0,
         catalogAvailability,
         verifiedCandidateCount: mergedCandidates.length,
       },
       matchedProducts: finalMatches,
-      rejectedCandidates: rejectedCandidates.slice(0, 4),
+      rejectedCandidates: rejectedCandidates.slice(0, 6),
       technicalAdvice: parsedResult.technicalAdvice || 'قبل از نصب، از هم‌راستایی فولی‌ها و عدم لنگی شفت اطمینان حاصل فرمایید.',
     });
   } catch (error: any) {
-    // Graceful fallback with intelligent algorithmic matching against the 864 products
+    // Graceful fallback: STRICT 100% POLICY applies here too.
+    // Without a successful AI run we only trust the perceptual-hash EXACT
+    // duplicate detector. No lookalike products are ever returned.
     const numLength = req.body?.length ? parseFloat(req.body.length) : undefined;
     const numWidth = req.body?.width ? parseFloat(req.body.width) : undefined;
     const numPitch = req.body?.pitch ? parseFloat(req.body.pitch) : undefined;
 
-    const fallbackMatches = searchCatalogProducts({
-      partType: req.body?.application || '',
-      length: numLength,
-      width: numWidth,
-      pitch: numPitch,
-      application: req.body?.application,
-      features: req.body?.features,
-    });
+    console.error('[AI Search] Falling back to offline exact-visual matching:', error?.message, error?.aiDetail || '');
 
-    console.error('[AI Search] Falling back to algorithmic matching:', error?.message, error?.aiDetail || '');
-
-    // Even when AI fails or times out, visual search on the uploaded image takes priority
     let catchVisualRes: VisualCandidateResult = { candidates: [], exactVisualMatch: false, bestDistance: 999 };
     try {
       const catchImage = await normalizeImageInput(req.body?.imageBase64, req.body?.mimeType);
@@ -1349,59 +1561,43 @@ ${stageInstruction}
     }
 
     const catchExact = catchVisualRes.exactVisualMatch;
-    let fallbackCandidates: any[] = [];
+    const exactFallback = (catchVisualRes.candidates || []).filter(c => c.visualDistance <= VISUAL_EXACT_MAX);
 
-    if (catchVisualRes.candidates.length > 0) {
-      fallbackCandidates = catchVisualRes.candidates;
-    } else {
-      fallbackCandidates = searchCatalogProducts({
-        partType: req.body?.application || '',
-        length: numLength,
-        width: numWidth,
-        pitch: numPitch,
-        application: req.body?.application,
-        features: req.body?.features,
-        limit: 4,
-      });
-    }
-
-    const errSignals =
-      (numLength ? 1 : 0) + (numWidth ? 1 : 0) + (numPitch ? 1 : 0) +
-      (req.body?.application ? 1 : 0) + (req.body?.features ? 1 : 0);
-
-    const mergedFallback = fallbackCandidates.map((m: any, idx: number) => ({
+    const mergedFallback = exactFallback.map(m => ({
       ...m,
-      distinction: idx === 1 ? 'گزینه مکمل با ویژگی عملکردی مشابه' : 'کالای اصلی با بالاترین تطابق ظاهری در کاتالوگ',
-      visualVerdict: catchExact && idx === 0 ? 'exact_match' : 'very_similar',
-      visualVerdictFarsi: catchExact && idx === 0 ? 'همونه (انطباق مستقیم قطعی)' : 'شبیهه (مدل مشابه استاندارد)',
-      visualExplanation: catchExact && idx === 0
-        ? 'تصویر ارسالی شما عیناً با تصویر این کالا در کاتالوگ مطابقت دارد.'
-        : 'مشخصات بصری و فرم هندسی این قطعه بیشترین تطابق را با تصویر ارسالی دارد.',
+      distinction: 'عیناً همان تصویر کاتالوگ',
+      visualVerdict: 'exact_match' as const,
+      visualVerdictFarsi: 'همونه (انطباق مستقیم قطعی)',
+      visualExplanation: 'تصویر ارسالی شما عیناً با تصویر این کالا در کاتالوگ مطابقت دارد.',
     }));
 
     return res.json({
       success: true,
       isAiGenerated: false,
       stage: reqStage,
-      fallbackNotice: 'سیستم از موتور تطبیق بصری و ابعادی کاتالوگ استفاده کرد.',
+      fallbackNotice: catchExact
+        ? 'تحلیل کامل هوش مصنوعی موقتاً در دسترس نبود؛ تطابق تصویری دقیق (عین عکس کاتالوگ) انجام شد.'
+        : 'تحلیل کامل هوش مصنوعی موقتاً در دسترس نبود و موتور تطبیق تصویری آفلاین هیچ انطباق قطعی با کاتالوگ پیدا نکرد.',
       summary: {
         detectedPartType: catchExact ? mergedFallback[0].name : 'قطعه تخصصی صنعتی خطوط تولید',
         detectedProfile: catchExact
           ? `عیناً همین کالا در سایت موجود است (${mergedFallback[0].code})`
           : numLength
             ? `انطباق با ابعاد ${numLength}×${numWidth || 50}mm`
-            : 'تسمه و تجهیزات استاندارد اطلس',
+            : 'قطعه خارج از کاتالوگ فعلی',
         visualAnalysis: catchExact
           ? 'عکس ارسالی شما عیناً با تصویر یکی از کالاهای سایت مطابقت دارد و همان محصول در صدر نتایج نمایش داده شد.'
-          : 'تحلیل بصری عکس و انطباق با جدول ۸۶۴ قلم کالای رسمی کاتالوگ هایپر صنعت اطلس انجام گرفت.',
-        confidence: catchExact ? 99 : catchVisualRes.candidates.length > 0 ? 88 : Math.min(55 + errSignals * 7, 89),
+          : 'تحلیل بصری آفلاین انجام شد و هیچ انطباق قطعی با کالاهای کاتالوگ یافت نشد؛ عین این قطعه در کاتالوگ فعلی موجود نیست.',
+        confidence: catchExact ? 99 : 55,
         exactVisualMatch: catchExact,
         catalogAvailability: {
-          status: catchExact ? 'confirmed_in_catalog' : 'similar_in_catalog',
-          statusFarsiTitle: catchExact ? 'تأیید شد: انطباق مستقیم با عکس کالای کاتالوگ (همونه)' : 'مدل مشابه استاندارد در کاتالوگ یافت شد (شبیهه)',
+          status: catchExact ? 'confirmed_in_catalog' : 'custom_order_available',
+          statusFarsiTitle: catchExact
+            ? 'تأیید شد: انطباق مستقیم با عکس کالای کاتالوگ (همونه)'
+            : 'عین این قطعه در کاتالوگ فعلی موجود نیست — می‌توانیم برایتان بسازیم',
           statusFarsiMessage: catchExact
             ? 'تصویر ارسالی عیناً با عکس ثبت‌شده این کالا در کاتالوگ اطلس مطابقت دارد.'
-            : 'این قطعه از نظر ساختار فیزیکی با نمونه شما همخوانی دارد و آماده سفارش است.',
+            : 'هیچ انطباق قطعی با کالاهای کاتالوگ یافت نشد؛ کارگاه تخصصی هایپر صنعت اطلس توانایی ساخت یا تأمین سفارشی همین قطعه را دارد.',
         },
       },
       matchedProducts: mergedFallback,
