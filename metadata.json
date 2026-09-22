@@ -1,7 +1,9 @@
 {
   "name": "Remix Remix هایپر صنعت  2",
   "description": "پلتفرم تخصصی فروش، پخش و نمایندگی آنلاین تسمه‌های صنعتی و قطعات کارخانجات کاشی، سرامیک و نساجی - تأسیس ۱۳۶۶ یزد",
-  "requestFramePermissions": [],
+  "requestFramePermissions": [
+    "camera"
+  ],
   "majorCapabilities": [
     "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
   ]

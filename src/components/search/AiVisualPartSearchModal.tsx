@@ -27,6 +27,7 @@ import {
   ShieldCheck,
   Eye,
   Wrench,
+  Bot,
 } from 'lucide-react';
 import { Modal } from '../ui/Modal';
 import {
@@ -399,6 +400,35 @@ export const AiVisualPartSearchModal: React.FC<Props> = ({ isOpen, onClose }) =>
               transition={{ duration: 0.18 }}
               className="space-y-5"
             >
+              {/* Link to Full Visual Agent Workspace */}
+              <div className="p-3 rounded-2xl bg-gradient-to-r from-slate-900 via-indigo-950 to-slate-900 text-white flex items-center justify-between gap-3 shadow-md border border-indigo-800/40">
+                <div className="flex items-center gap-2.5">
+                  <div className="w-8 h-8 rounded-xl bg-cyan-500/20 border border-cyan-400/40 flex items-center justify-center text-cyan-300">
+                    <Bot className="w-4 h-4" />
+                  </div>
+                  <div className="text-right">
+                    <div className="text-xs font-bold text-white flex items-center gap-1.5">
+                      <span>محیط ایژنت مهندسی و گفتگوی زنده هوش مصنوعی</span>
+                      <span className="text-[9px] bg-cyan-500/30 text-cyan-200 px-1.5 py-0.5 rounded">ویژه</span>
+                    </div>
+                    <div className="text-[10px] text-slate-300">
+                      تطبیق چشمی دو‌به‌دو با کاتالوگ ۸۶۴ قلمی و پاسخ به سؤالات فنی
+                    </div>
+                  </div>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => {
+                    onClose();
+                    navigate('/visual-agent');
+                  }}
+                  className="px-3 py-1.5 rounded-xl bg-cyan-500 hover:bg-cyan-400 text-slate-950 text-xs font-bold transition-all shrink-0 flex items-center gap-1 cursor-pointer"
+                >
+                  <span>ورود به ایژنت</span>
+                  <ArrowLeft className="w-3.5 h-3.5" />
+                </button>
+              </div>
+
               {/* Header Title */}
               <div className="text-center space-y-1">
                 <h4 className="text-base font-black text-[#0A172F] flex items-center justify-center gap-2">
