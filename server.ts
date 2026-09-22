@@ -66,20 +66,24 @@ async function callGeminiModelWithTimeout(
   try {
     return await attempt();
   } catch (err: any) {
-    const isTransient =
+    // Only 503 (temporary capacity) is worth an immediate retry.
+    // 429 means the daily quota is exhausted — retrying wastes time.
+    const isTransient503 =
       err?.status === 503 ||
-      err?.message?.includes('503') ||
-      err?.status === 429 ||
-      err?.message?.includes('429');
+      (!err?.status && err?.message?.includes('503'));
 
-    if (isTransient) {
-      // Exponential jitter/backoff retry once for temporary capacity spikes
-      await new Promise((r) => setTimeout(r, 600));
+    if (isTransient503) {
+      // Short backoff retry once for temporary capacity spikes
+      await new Promise((r) => setTimeout(r, 400));
       return await attempt();
     }
     throw err;
   }
 }
+
+// The most recent model that answered successfully — tried first on the next
+// call so we skip the 429-quota cascade dance after the first success.
+let lastGoodAiModel: string | null = null;
 
 async function generateWithModelCascade(
   ai: GoogleGenAI,
@@ -90,10 +94,14 @@ async function generateWithModelCascade(
   timeoutMs = 15000
 ): Promise<{ text: string; model: string }> {
   let lastError = '';
-  for (const model of models) {
+  const ordered = lastGoodAiModel
+    ? [lastGoodAiModel, ...models.filter(m => m !== lastGoodAiModel)]
+    : models;
+  for (const model of ordered) {
     try {
       const text = await callGeminiModelWithTimeout(ai, model, contents, config, timeoutMs);
       if (text && text.trim()) {
+        lastGoodAiModel = model;
         return { text, model };
       }
     } catch (err: any) {
@@ -153,8 +161,20 @@ try {
 const IMAGE_HASH_CACHE_PATH = path.join(process.cwd(), 'src', 'data', 'imageHashes.json');
 const CATALOG_IMAGES_DIR = path.join(process.cwd(), 'src', 'assets', 'imagesproducts');
 
-// filename -> 64-hex-char dHash
-const IMAGE_HASH_INDEX = new Map<string, string>();
+// Pure-visual multi-feature descriptor per catalog image.
+// NOTE: product names/codes in the current catalog data are known to be
+// unreliable — retrieval must depend ONLY on these image features.
+interface ImageFeatures {
+  dh: string;    // 256-bit difference hash (64 hex chars)
+  ph: string;    // 64-bit DCT perceptual hash (16 hex chars)
+  ah: string;    // 64-bit average hash (16 hex chars)
+  col: number[]; // 64-bin RGB color histogram (normalized, sums to 1)
+}
+
+const FEATURE_CACHE_VERSION = 2;
+
+// filename -> ImageFeatures
+const IMAGE_FEATURE_INDEX = new Map<string, ImageFeatures>();
 let visualIndexReady = false;
 
 // ----------------------------------------------------------------------------
@@ -203,20 +223,76 @@ function resolveCatalogImagePath(image?: string): string | null {
   return null;
 }
 
-async function computeDHash(buffer: Buffer): Promise<string> {
-  // 17x16 grayscale -> 16x16 = 256 bits
-  const raw = await sharp(buffer).resize(17, 16, { fit: 'fill' }).grayscale().raw().toBuffer();
-  let bits = '';
-  for (let y = 0; y < 16; y++) {
-    for (let x = 0; x < 16; x++) {
-      bits += raw[y * 17 + x] > raw[y * 17 + x + 1] ? '1' : '0';
-    }
-  }
+function bitsToHex(bits: string): string {
   let hex = '';
-  for (let i = 0; i < 256; i += 4) {
+  for (let i = 0; i < bits.length; i += 4) {
     hex += parseInt(bits.slice(i, i + 4), 2).toString(16);
   }
   return hex;
+}
+
+// 64-bit DCT perceptual hash over a 32x32 grayscale buffer
+function dctPHash(pixels: Buffer): string {
+  const N = 32;
+  const M = 8;
+  const c = (u: number) => (u === 0 ? Math.SQRT1_2 : 1);
+  const dct = new Float64Array(M * M);
+  for (let u = 0; u < M; u++) {
+    for (let v = 0; v < M; v++) {
+      let s = 0;
+      for (let x = 0; x < N; x++) {
+        for (let y = 0; y < N; y++) {
+          s +=
+            pixels[y * N + x] *
+            Math.cos(((2 * x + 1) * u * Math.PI) / (2 * N)) *
+            Math.cos(((2 * y + 1) * v * Math.PI) / (2 * N));
+        }
+      }
+      dct[u * M + v] = c(u) * c(v) * s;
+    }
+  }
+  const sorted = Array.from(dct).sort((a, b) => a - b);
+  const med = sorted[32];
+  let bits = '';
+  for (let i = 0; i < 64; i++) bits += dct[i] > med ? '1' : '0';
+  return bitsToHex(bits);
+}
+
+// Extract the full pure-visual feature set from an image buffer.
+async function computeImageFeatures(buffer: Buffer): Promise<ImageFeatures> {
+  // 256-bit difference hash (17x16 grayscale)
+  const raw17 = await sharp(buffer).resize(17, 16, { fit: 'fill' }).grayscale().raw().toBuffer();
+  let dbits = '';
+  for (let y = 0; y < 16; y++) {
+    for (let x = 0; x < 16; x++) {
+      dbits += raw17[y * 17 + x] > raw17[y * 17 + x + 1] ? '1' : '0';
+    }
+  }
+  const dh = bitsToHex(dbits);
+
+  // 64-bit average hash (8x8 grayscale)
+  const raw8 = await sharp(buffer).resize(8, 8, { fit: 'fill' }).grayscale().raw().toBuffer();
+  const mean8 = raw8.reduce((a, b) => a + b, 0) / 64;
+  let abits = '';
+  for (let i = 0; i < 64; i++) abits += raw8[i] > mean8 ? '1' : '0';
+  const ah = bitsToHex(abits);
+
+  // 64-bit DCT perceptual hash (32x32 grayscale)
+  const raw32 = await sharp(buffer).resize(32, 32, { fit: 'fill' }).grayscale().raw().toBuffer();
+  const ph = dctPHash(raw32);
+
+  // 64-bin RGB color histogram (16x16, 4 levels per channel)
+  const rgb = await sharp(buffer).resize(16, 16, { fit: 'fill' }).removeAlpha().raw().toBuffer();
+  const col = new Array(64).fill(0);
+  for (let i = 0; i < 256; i++) {
+    const r = Math.min(3, rgb[i * 3] >> 6);
+    const g = Math.min(3, rgb[i * 3 + 1] >> 6);
+    const b = Math.min(3, rgb[i * 3 + 2] >> 6);
+    col[r * 16 + g * 4 + b]++;
+  }
+  for (let i = 0; i < 64; i++) col[i] /= 256;
+
+  return { dh, ph, ah, col };
 }
 
 function hammingDistance(h1: string, h2: string): number {
@@ -232,21 +308,21 @@ function hammingDistance(h1: string, h2: string): number {
   return d;
 }
 
-async function buildImageHashIndex(): Promise<void> {
+async function buildImageFeatureIndex(): Promise<void> {
   try {
     buildCatalogImageAliases();
 
-    // 1) Try loading cache
+    // 1) Try loading cache (v2 multi-feature format)
     if (fs.existsSync(IMAGE_HASH_CACHE_PATH)) {
       try {
         const cached = JSON.parse(fs.readFileSync(IMAGE_HASH_CACHE_PATH, 'utf8')) as {
           version: number;
-          entries: Record<string, string>;
+          entries: Record<string, ImageFeatures>;
         };
-        if (cached && cached.version === 1 && cached.entries) {
-          for (const [file, hash] of Object.entries(cached.entries)) {
-            if (typeof hash === 'string' && hash.length === 64) {
-              IMAGE_HASH_INDEX.set(file, hash);
+        if (cached && cached.version === FEATURE_CACHE_VERSION && cached.entries) {
+          for (const [file, feat] of Object.entries(cached.entries)) {
+            if (feat && typeof feat.dh === 'string' && feat.dh.length === 64 && Array.isArray(feat.col)) {
+              IMAGE_FEATURE_INDEX.set(file, feat);
             }
           }
         }
@@ -255,46 +331,46 @@ async function buildImageHashIndex(): Promise<void> {
       }
     }
 
-    // 2) Hash any catalog image missing from the index
+    // 2) Extract features for any catalog image missing from the index
     let newlyHashed = 0;
     for (const item of CATALOG_ITEMS) {
       const file = (item.image || '').trim();
-      if (!file || IMAGE_HASH_INDEX.has(file)) continue;
+      if (!file || IMAGE_FEATURE_INDEX.has(file)) continue;
       const fullPath = resolveCatalogImagePath(file);
       if (!fullPath) continue;
       try {
         const buf = fs.readFileSync(fullPath);
-        IMAGE_HASH_INDEX.set(file, await computeDHash(buf));
+        IMAGE_FEATURE_INDEX.set(file, await computeImageFeatures(buf));
         newlyHashed++;
       } catch {
         // unreadable image -> skip
       }
     }
 
-    // 3) Persist cache if we hashed anything new
+    // 3) Persist cache if we extracted anything new
     if (newlyHashed > 0) {
       try {
         fs.writeFileSync(
           IMAGE_HASH_CACHE_PATH,
-          JSON.stringify({ version: 1, entries: Object.fromEntries(IMAGE_HASH_INDEX) })
+          JSON.stringify({ version: FEATURE_CACHE_VERSION, entries: Object.fromEntries(IMAGE_FEATURE_INDEX) })
         );
       } catch {
         // cache write failure is non-fatal
       }
     }
 
-    visualIndexReady = IMAGE_HASH_INDEX.size > 0;
+    visualIndexReady = IMAGE_FEATURE_INDEX.size > 0;
     console.log(
-      `[Server] Visual hash index ready: ${IMAGE_HASH_INDEX.size} catalog images` +
-        (newlyHashed > 0 ? ` (${newlyHashed} newly hashed)` : ' (from cache)')
+      `[Server] Visual feature index ready: ${IMAGE_FEATURE_INDEX.size} catalog images` +
+        (newlyHashed > 0 ? ` (${newlyHashed} newly processed)` : ' (from cache)')
     );
   } catch (e: any) {
-    console.error('[Server] Visual hash index failed (visual search disabled):', e.message);
+    console.error('[Server] Visual feature index failed (visual search disabled):', e.message);
   }
 }
 
 // Build in background so server startup isn't blocked on first run
-void buildImageHashIndex();
+void buildImageFeatureIndex();
 
 function brandForCatalogItem(item: CatalogItem): string {
   const itemName = item.name.toLowerCase();
@@ -325,22 +401,10 @@ interface VisualMatch {
   visualDistance: number;
 }
 
-// Distance thresholds on the 256-bit dHash, calibrated on the real catalog:
-// - identical file/screenshot            -> d = 0..8
-// - re-saved / recompressed re-upload    -> d = 20..40
-// - different product (nearest lookalike)-> d >= 22
-// - unrelated photo                      -> d >= 100
-const VISUAL_EXACT_MAX = 12; // عین همان تصویر سایت (تشخیص قطعی)
-const VISUAL_SIMILAR_MAX = 40; // بسیار شبیه (احتمالاً همان محصول، مثلاً فورواردشده/فشرده)
-
-function visualScoreForDistance(d: number): number {
-  if (d <= 3) return 99;
-  if (d <= 6) return 98;
-  if (d <= VISUAL_EXACT_MAX) return 97;
-  if (d <= 20) return 94;
-  if (d <= 30) return 91;
-  return 88;
-}
+// Combined visual distance threshold for "this is the same image file"
+// (user re-uploaded / screenshotted a catalog photo). On the 0..1 combined
+// feature-distance scale, near-duplicates land well below 0.07.
+const VISUAL_DUPLICATE_MAX = 0.07;
 
 interface VisualCandidateResult {
   candidates: (VisualMatch & { visualDistance: number; isVisualMatch: true })[];
@@ -348,145 +412,48 @@ interface VisualCandidateResult {
   bestDistance: number;
 }
 
-// Pure visual appearance matching across all 864 catalog product images:
-// Computes perceptual hash distance, geometric shape matching, and stamped code matching
-async function rankCatalogItemsByVisualAppearance(options: {
-  queryBuffer: Buffer;
-  visualShape?: string;
-  objectColor?: string;
-  detectedCode?: string;
-  length?: number;
-  width?: number;
-  pitch?: number;
-  topK?: number;
-}): Promise<VisualCandidateResult> {
-  const {
-    queryBuffer,
-    visualShape = '',
-    objectColor = '',
-    detectedCode = '',
-    length,
-    width,
-    pitch,
-    topK = 4,
-  } = options;
+interface NormBox {
+  x_min: number;
+  y_min: number;
+  x_max: number;
+  y_max: number;
+}
 
-  if (!visualIndexReady || IMAGE_HASH_INDEX.size === 0 || !CATALOG_ITEMS || CATALOG_ITEMS.length === 0) {
+// Weighted combination of perceptual distances (each normalized 0..1).
+function visualFeatureDistance(a: ImageFeatures, b: ImageFeatures): number {
+  const dDh = hammingDistance(a.dh, b.dh) / 256;
+  const dPh = hammingDistance(a.ph, b.ph) / 64;
+  const dAh = hammingDistance(a.ah, b.ah) / 64;
+  let l1 = 0;
+  for (let i = 0; i < 64; i++) l1 += Math.abs(a.col[i] - b.col[i]);
+  const dCol = Math.min(1, l1 / 2);
+  return 0.45 * dDh + 0.25 * dPh + 0.1 * dAh + 0.2 * dCol;
+}
+
+// PURE VISUAL ranking over all catalog images.
+// No names, no codes, no categories, no dimensions — the catalog text data is
+// currently unreliable, so the ONLY signal is image appearance.
+function rankByVisualFeatures(queryFeatList: ImageFeatures[], topK = 8): VisualCandidateResult {
+  if (!visualIndexReady || IMAGE_FEATURE_INDEX.size === 0 || !CATALOG_ITEMS || CATALOG_ITEMS.length === 0) {
     return { candidates: [], exactVisualMatch: false, bestDistance: 999 };
   }
-
-  let queryHash: string;
-  try {
-    queryHash = await computeDHash(queryBuffer);
-  } catch (err) {
-    console.error('[Visual Retrieval] Failed to compute dHash for query buffer:', err);
-    return { candidates: [], exactVisualMatch: false, bestDistance: 999 };
-  }
-
-  const norm = (s: string) => (s || '').toLowerCase().replace(/[\s\-_/.:؛,،()]+/g, '');
-  const cleanCode = norm(detectedCode);
 
   let minDistance = 999;
-
   const scored = CATALOG_ITEMS.map(item => {
-    const file = (item.image || '').trim();
-    const h = file ? IMAGE_HASH_INDEX.get(file) : undefined;
-    const dist = h ? hammingDistance(queryHash, h) : 999;
+    const f = item.image ? IMAGE_FEATURE_INDEX.get(item.image) : undefined;
+    let dist = 999;
+    if (f && queryFeatList.length > 0) {
+      dist = Math.min(...queryFeatList.map(q => visualFeatureDistance(q, f)));
+    }
     if (dist < minDistance) minDistance = dist;
-
-    // 1. Base visual distance score (scale 0..100)
-    let score = Math.max(0, 100 - (dist / 1.5));
-
-    // 2. Exact or very close perceptual visual hash hit
-    if (dist <= VISUAL_EXACT_MAX) {
-      score += 250; // Guaranteed top priority (exact catalog image match)
-    } else if (dist <= 25) {
-      score += 120;
-    } else if (dist <= 40) {
-      score += 50;
-    }
-
-    // 3. Stamped/printed code or numbers from the part (e.g. 1000 0 1, HTD, 35154, AT-E...)
-    if (cleanCode && cleanCode.length >= 3) {
-      const codeNorm = norm(item.code);
-      const forzaNorm = norm(item.forzaCode || '');
-      const nameNorm = norm(item.name);
-      if (forzaNorm.includes(cleanCode) || codeNorm.includes(cleanCode) || nameNorm.includes(cleanCode)) {
-        score += 160;
-      }
-    }
-
-    // 4. Physical shape & visual family alignment
-    const subcat = (item.subcategory || '').toLowerCase();
-    const cat = (item.categoryName || '').toLowerCase();
-    const itemName = item.name.toLowerCase();
-
-    if (visualShape === 'pulley_wheel') {
-      if (subcat.includes('فولی') || subcat.includes('هرزگرد') || subcat.includes('چرخ') || itemName.includes('فولی') || itemName.includes('پولی')) {
-        score += 35;
-      }
-    } else if (visualShape === 'bushing_coupling') {
-      if (subcat.includes('بوش') || subcat.includes('کوپلینگ') || itemName.includes('بوش') || itemName.includes('کوپلینگ')) {
-        score += 35;
-      }
-    } else if (visualShape === 'tensioner_bracket') {
-      if (subcat.includes('کشنده') || subcat.includes('رگلاژ') || itemName.includes('کشنده') || itemName.includes('اهرم') || itemName.includes('رگلاژ')) {
-        score += 35;
-      }
-    } else if (visualShape === 'timing_belt') {
-      if (subcat.includes('تایمینگ') || cat.includes('تسمه') || itemName.includes('تایمینگ')) {
-        score += 35;
-      }
-    } else if (visualShape === 'v_belt') {
-      if (subcat.includes('v-belt') || subcat.includes('ویبلت') || itemName.includes('شیاردار')) {
-        score += 35;
-      }
-    } else if (visualShape === 'impeller_propeller') {
-      if (subcat.includes('پروانه') || subcat.includes('همزن') || itemName.includes('پروانه')) {
-        score += 45;
-      }
-    } else if (visualShape === 'suction_pad') {
-      if (subcat.includes('بادکش') || subcat.includes('مکنده') || itemName.includes('وکیوم') || itemName.includes('مکنده')) {
-        score += 45;
-      }
-    } else if (visualShape === 'brush_cleaner') {
-      if (subcat.includes('برس') || subcat.includes('فرچه') || itemName.includes('برس')) {
-        score += 45;
-      }
-    } else if (visualShape === 'diaphragm_pump') {
-      if (subcat.includes('دیافراگم') || subcat.includes('پمپ') || itemName.includes('دیافراگم')) {
-        score += 40;
-      }
-    } else if (visualShape === 'roller_pin') {
-      if (subcat.includes('رولر') || subcat.includes('پین') || itemName.includes('پین') || itemName.includes('شفت')) {
-        score += 35;
-      }
-    } else if (visualShape === 'guide_rail_profile') {
-      if (subcat.includes('پروفیل') || subcat.includes('ریل') || itemName.includes('راهنما')) {
-        score += 35;
-      }
-    } else if (visualShape === 'bearing_housing') {
-      if (subcat.includes('یاتاقان') || subcat.includes('هوزینگ') || subcat.includes('بلبرینگ') || itemName.includes('یاتاقان')) {
-        score += 35;
-      }
-    }
-
-    // 5. Optional dimensional alignment if provided by user
-    if (length || width) {
-      const itemSpecs = (item.specs || []).map(s => `${s.key} ${s.value}`).join(' ');
-      if (length && itemSpecs.includes(String(length))) score += 20;
-      if (width && itemSpecs.includes(String(width))) score += 20;
-    }
-
-    return { item, distance: dist, score };
+    return { item, distance: dist };
   });
 
-  scored.sort((a, b) => b.score - a.score);
+  scored.sort((a, b) => a.distance - b.distance);
 
-  // Deduplicate by image so that candidates represent distinct visual products from the catalog
+  // Deduplicate by image so candidates represent distinct catalog photos
   const seenImages = new Set<string>();
   const distinctCandidates: typeof scored = [];
-
   for (const s of scored) {
     const img = (s.item.image || '').trim();
     if (!seenImages.has(img)) {
@@ -496,7 +463,7 @@ async function rankCatalogItemsByVisualAppearance(options: {
     }
   }
 
-  const exactVisualMatch = minDistance <= VISUAL_EXACT_MAX;
+  const exactVisualMatch = minDistance <= VISUAL_DUPLICATE_MAX;
 
   const candidates: (VisualMatch & { visualDistance: number; isVisualMatch: true })[] = distinctCandidates.map(({ item, distance }) => ({
     code: item.code,
@@ -508,262 +475,61 @@ async function rankCatalogItemsByVisualAppearance(options: {
     subcategory: item.subcategory,
     cataloguePage: item.page,
     image: item.image,
-    similarityScore: distance <= VISUAL_EXACT_MAX ? 99 : visualScoreForDistance(distance),
+    similarityScore: distance <= VISUAL_DUPLICATE_MAX ? 99 : Math.max(55, Math.min(92, Math.round(99 - distance * 55))),
     matchReason:
-      distance <= VISUAL_EXACT_MAX
-        ? '🎯 انطباق تصویری مستقیم: عکس شما عیناً با تصویر رسمی این کالا در کاتالوگ اطلس مطابقت دارد'
-        : 'انطباق تصویری: فرم و هندسه ظاهری این قطعه در کاتالوگ بیشترین شباهت را به عکس ارسالی شما دارد',
-    specs:
-      item.specs && item.specs.length > 0
-        ? item.specs.slice(0, 4)
-        : [
-            { key: 'کد کاتالوگ', value: item.forzaCode || item.code },
-            { key: 'صفحه کاتالوگ', value: `صفحه ${item.page}` },
-            { key: 'دسته‌بندی', value: item.categoryName },
-          ],
+      distance <= VISUAL_DUPLICATE_MAX
+        ? '🎯 عکس شما عیناً همان تصویر این کالا در کاتالوگ اطلس است'
+        : 'کاندیدای برگزیده از نظر شباهت ظاهری برای راستی‌آزمایی بصری چهره‌به‌چهره با عکس شما',
+    specs: [],
     price: item.price,
     stock: item.stock,
     isVisualMatch: true as const,
-    visualDistance: distance,
+    visualDistance: Number(distance.toFixed(4)),
   }));
 
-  return {
-    candidates,
-    exactVisualMatch,
-    bestDistance: minDistance,
-  };
+  return { candidates, exactVisualMatch, bestDistance: minDistance };
 }
 
-async function searchByImage(imageBuffer: Buffer, topK = 4): Promise<VisualMatch[]> {
-  const res = await rankCatalogItemsByVisualAppearance({ queryBuffer: imageBuffer, topK });
-  return res.candidates.filter(r => r.visualDistance <= VISUAL_SIMILAR_MAX);
+// Crop the user's photo to the AI-detected part region (with a small margin)
+// so background clutter does not pollute the perceptual features.
+async function cropToBoundingBox(buffer: Buffer, bb: NormBox, padRatio = 0.08): Promise<Buffer> {
+  const meta = await sharp(buffer).metadata();
+  const W = meta.width || 0;
+  const H = meta.height || 0;
+  if (!W || !H) return buffer;
+  const bw = ((bb.x_max - bb.x_min) / 1000) * W;
+  const bh = ((bb.y_max - bb.y_min) / 1000) * H;
+  const left = Math.max(0, Math.round((bb.x_min / 1000) * W - bw * padRatio));
+  const top = Math.max(0, Math.round((bb.y_min / 1000) * H - bh * padRatio));
+  const width = Math.min(W - left, Math.round(bw * (1 + 2 * padRatio)));
+  const height = Math.min(H - top, Math.round(bh * (1 + 2 * padRatio)));
+  if (width < 24 || height < 24) return buffer;
+  return sharp(buffer).extract({ left, top, width, height }).toBuffer();
 }
 
-// ----------------------------------------------------------------------------
-// Stamped-code identification: if the AI can read a code/number printed on the
-// physical part (e.g. "1000 0 1" on a FORZA coupling bush) and that code maps
-// to exactly one catalog item, that is the strongest possible identity signal.
-// ----------------------------------------------------------------------------
-function normalizeStampCode(s: string): string {
-  return (s || '')
-    .toLowerCase()
-    .replace(/forzacode\s*:?/gi, '')
-    .replace(/[\s\-_/.:؛,،()[\]]+/g, '');
-}
-
-function findCatalogItemsByStampedCode(detectedCode: string): CatalogItem[] {
-  const clean = normalizeStampCode(detectedCode);
-  if (!clean || clean.length < 4) return [];
-  const hits: CatalogItem[] = [];
-  for (const item of CATALOG_ITEMS) {
-    const forzaNorm = normalizeStampCode(item.forzaCode || '');
-    const codeNorm = normalizeStampCode(item.code || '');
-    // exact equality, or the stamped number is exactly the numeric part of the FORZA code
-    if (codeNorm === clean || (forzaNorm && forzaNorm === clean)) {
-      hits.push(item);
+// Compute visual candidates for a user photo. Features are extracted from the
+// full image AND (when available) the cropped part region; the best match
+// against each catalog image wins.
+async function getVisualCandidateResult(queryBuffer: Buffer, boundingBox?: NormBox): Promise<VisualCandidateResult> {
+  if (!visualIndexReady || IMAGE_FEATURE_INDEX.size === 0 || !CATALOG_ITEMS || CATALOG_ITEMS.length === 0) {
+    return { candidates: [], exactVisualMatch: false, bestDistance: 999 };
+  }
+  const featList: ImageFeatures[] = [];
+  try {
+    featList.push(await computeImageFeatures(queryBuffer));
+  } catch (err) {
+    console.error('[Visual Retrieval] feature extraction failed:', err);
+    return { candidates: [], exactVisualMatch: false, bestDistance: 999 };
+  }
+  if (boundingBox) {
+    try {
+      const cropped = await cropToBoundingBox(queryBuffer, boundingBox);
+      featList.push(await computeImageFeatures(cropped));
+    } catch {
+      // cropping is best-effort
     }
   }
-  return hits;
-}
-
-// Intelligent matching against the 864 catalog products
-function searchCatalogProducts(params: {
-  partType?: string;
-  profile?: string;
-  keywords?: string[];
-  suggestedForzaCode?: string;
-  length?: number;
-  width?: number;
-  pitch?: number;
-  application?: string;
-  features?: string;
-  limit?: number;
-}) {
-  const {
-    partType = '',
-    profile = '',
-    keywords = [],
-    suggestedForzaCode = '',
-    length,
-    width,
-    pitch,
-    application = '',
-    features = '',
-    limit = 4,
-  } = params;
-
-  if (!CATALOG_ITEMS || CATALOG_ITEMS.length === 0) {
-    return [];
-  }
-
-  // Generic words that match almost every catalog item -> excluded from scoring
-  // so that only discriminative words (تایمینگ، کوپلینگ، پلی‌یورتان، بلبرینگ، ...) count.
-  const STOPWORDS = new Set([
-    'تسمه', 'های', 'صنعتی', 'صنعت', 'قطعه', 'قطعات', 'خطوط', 'خط', 'تولید',
-    'کاشی', 'سرامیک', 'برای', 'دستگاه', 'مقاوم', 'استاندارد', 'فورزا', 'forza',
-    'موتور', 'پمپ', 'کارخانه', 'کارخانجات', 'ماشین', 'آلات', 'ماشین‌آلات',
-    'شرکت', 'اطلس', 'بازرگانی', 'تجهیز', 'تجهیزات', 'انواع', 'سیستم', 'هایپر',
-    'ویژه', 'اصلی', 'اورجینال', 'مدل', 'کد', 'عدد', 'سایز', 'نوع', 'برند',
-    'میلی', 'متر', 'میلیمتر', 'درجه', 'بالا', 'گرید', 'جدید', 'تک', 'دنده',
-  ]);
-
-  const splitWords = (text: string) =>
-    text
-      .toLowerCase()
-      .split(/[\s,،؛:()\-_./]+/)
-      .filter(w => w && w.length >= 2 && !STOPWORDS.has(w));
-
-  // Normalize codes for comparison: ignore spaces/dashes/underscores (1000-0-1 == 1000 0 1)
-  const normCode = (s: string) => s.toLowerCase().replace(/[\s\-_]+/g, '');
-
-  const cleanForza = suggestedForzaCode.replace(/forzacode\s*:\s*/i, '').trim().toLowerCase();
-  const cleanForzaNorm = normCode(cleanForza);
-  const kwList = [...new Set([
-    ...keywords.flatMap(splitWords),
-    ...splitWords(partType),
-    ...splitWords(profile),
-    ...splitWords(features),
-    ...splitWords(application),
-  ])];
-
-  const partTypeWords = splitWords(partType);
-  const isTensionerOrPulley = kwList.some(k => /هرزگرد|قرقره|تنشنر|پولی|فولی|اهرم|سفت/i.test(k));
-  const isCouplingOrBush = kwList.some(k => /کوپلینگ|بوش|لاستیک.*کوپلینگ|الاستومر/i.test(k));
-  const isBelt = kwList.some(k => /تایمینگ|تسمه|بلت|ویبلت|شیار/i.test(k));
-  const isRoller = kwList.some(k => /رولر|رولیک|کوره|پین/i.test(k));
-
-  const scored = CATALOG_ITEMS.map(item => {
-    let score = 5;
-    const reasons: string[] = [];
-
-    const itemName = item.name.toLowerCase();
-    const itemForza = (item.forzaCode || '').toLowerCase();
-    const itemForzaNorm = normCode(itemForza);
-    const itemNameNorm = normCode(item.name);
-    const itemSubcat = (item.subcategory || '').toLowerCase();
-    const itemCat = (item.categoryName || '').toLowerCase();
-    const itemSpecs = (item.specs || []).map(s => `${s.key} ${s.value}`.toLowerCase()).join(' ');
-
-    // 1. Exact or partial FORZACODE matching (strongest signal)
-    if (cleanForzaNorm && cleanForzaNorm.length >= 3) {
-      if (itemForzaNorm.includes(cleanForzaNorm) || itemNameNorm.includes(cleanForzaNorm)) {
-        score += 65;
-        reasons.push(`انطباق مستقیم با کد رسمی کاتالوگ (${item.forzaCode})`);
-      }
-    }
-
-    // 2. Domain family boosts
-    if (isTensionerOrPulley) {
-      if (itemSubcat.includes('فولی') || itemSubcat.includes('هرزگرد') || itemSubcat.includes('رگلاژ') || itemSubcat.includes('کانوایر')) {
-        score += 25;
-      }
-      if (itemName.includes('اهرم') || itemName.includes('تنظیم') || itemName.includes('پولی') || itemName.includes('هرزگرد') || itemName.includes('بلبرینگ')) {
-        score += 20;
-      }
-    } else if (isCouplingOrBush) {
-      if (itemSubcat.includes('بوش') || itemSubcat.includes('کوپلینگ') || itemCat.includes('کوپلینگ')) {
-        score += 35;
-      }
-    } else if (isBelt) {
-      if (itemCat.includes('تسمه') || itemSubcat.includes('تایمینگ') || itemSubcat.includes('v-belt')) {
-        score += 25;
-      }
-    } else if (isRoller) {
-      if (itemSubcat.includes('رولر') || itemSubcat.includes('پین') || itemCat.includes('محرک')) {
-        score += 30;
-      }
-    }
-
-    // 3. Part type semantic matching (capped so generic leftovers can't dominate)
-    let partTypeScore = 0;
-    let partTypeHits = 0;
-    for (const word of partTypeWords) {
-      if (partTypeScore >= 40) break;
-      if (itemName.includes(word)) {
-        partTypeScore += 18;
-        partTypeHits++;
-      } else if (itemSubcat.includes(word)) {
-        partTypeScore += 10;
-        partTypeHits++;
-      } else if (itemCat.includes(word)) {
-        partTypeScore += 4;
-        partTypeHits++;
-      }
-    }
-    score += partTypeScore;
-    if (partTypeHits > 0 && reasons.length === 0) {
-      reasons.push(`انطباق با خانواده قطعات «${partType || item.categoryName}»`);
-    }
-
-    // 4. Keywords matching (deduped + capped)
-    let keywordScore = 0;
-    for (const kw of kwList) {
-      if (keywordScore >= 30) break;
-      if (normCode(itemForza).includes(normCode(kw)) && kw.length >= 3) {
-        keywordScore += 12;
-      } else if (itemName.includes(kw)) {
-        keywordScore += 8;
-      } else if (itemSubcat.includes(kw)) {
-        keywordScore += 6;
-      } else if (itemSpecs.includes(kw)) {
-        keywordScore += 4;
-      }
-    }
-    score += keywordScore;
-
-    // 5. Dimensional matching
-    if (length && length > 0) {
-      const lenStr = String(length);
-      if (itemName.includes(lenStr) || itemSpecs.includes(lenStr)) {
-        score += 25;
-        reasons.push(`انطباق طول اعلامی (${length}mm)`);
-      }
-    }
-
-    if (width && width > 0) {
-      const wStr = String(width);
-      if (itemName.includes(wStr) || itemSpecs.includes(wStr)) {
-        score += 18;
-        reasons.push(`انطباق عرض مقطع (${width}mm)`);
-      }
-    }
-
-    if (pitch && pitch > 0) {
-      const pStr = String(pitch);
-      if (itemName.includes(pStr) || itemSpecs.includes(pStr) || itemSpecs.includes(`گام ${pStr}`)) {
-        score += 15;
-        reasons.push(`تطابق گام دندانه (${pitch}mm)`);
-      }
-    }
-
-    const brand = brandForCatalogItem(item);
-
-    return {
-      code: item.code,
-      name: item.name,
-      forzaCode: item.forzaCode,
-      brand,
-      categorySlug: item.categorySlug,
-      categoryName: item.categoryName,
-      subcategory: item.subcategory,
-      cataloguePage: item.page,
-      image: item.image,
-      similarityScore: Math.min(Math.round(score), 99),
-      matchReason: reasons.length > 0 ? reasons.join(' و ') : 'انطباق بصری و ساختاری با مشخصات فنی کاتالوگ اطلس',
-      specs: item.specs && item.specs.length > 0
-        ? item.specs.slice(0, 4)
-        : [
-            { key: 'کد کاتالوگ', value: item.forzaCode || item.code },
-            { key: 'صفحه کاتالوگ', value: `صفحه ${item.page}` },
-            { key: 'دسته‌بندی', value: item.categoryName },
-          ],
-      price: item.price,
-      stock: item.stock,
-    };
-  });
-
-  scored.sort((a, b) => b.similarityScore - a.similarityScore);
-  return scored.slice(0, limit);
+  return rankByVisualFeatures(featList);
 }
 
 // Normalize any image input (data-URL, raw base64, or remote http URL) into
@@ -874,10 +640,11 @@ async function verifySingleCandidate(
       text: `تصویر شماره ۱: عکس واقعی ارسالی کاربر از یک قطعه صنعتی (ممکن است روی دستگاه یا در کارگاه باشد).
 توضیح آنچه کاربر فرستاده: ${whatYouSee || 'قطعه صنعتی'}
 
-تصویر شماره ۲: عکس رسمی یک کالای کاتالوگ هایپر صنعت اطلس — کد ${cand.code} (${cand.forzaCode || ''}) — نام کالا: «${cand.name}»
+تصویر شماره ۲: عکس رسمی یکی از کالاهای کاتالوگ هایپر صنعت اطلس
 
 شما سیستم راستی‌آزمایی بصری تخصصی اطلس هستید. سیاست ما «تطابق صددرصدی» است:
-- "exact_match": فقط وقتی که در تصویر ۲ «عیناً همان قطعه فیزیکی» تصویر ۱ است؛ فرم هندسی، تعداد و الگوی دندانه/شیار/پره/سوراخ، نسبت‌های ابعادی و جزئیات ساختاری کاملاً منطبق (زاویه دوربین، نور و پس‌زمینه ممکن است فرق کند، ولی خود جسم یکی است). اگر عدد یا کدی روی قطعه در تصویر ۱ خوانده می‌شود و با کد این کالا یکسان است، قوی‌ترین مدرک exact_match است.
+- "exact_match": فقط وقتی که در تصویر ۲ «عیناً همان قطعه فیزیکی» تصویر ۱ است؛ فرم هندسی، تعداد و الگوی دندانه/شیار/پره/سوراخ، نسبت‌های ابعادی و جزئیات ساختاری کاملاً منطبق (زاویه دوربین، نور و پس‌زمینه ممکن است فرق کند، ولی خود جسم یکی است).
+- اسم و کد کالا در اینجا اصلاً اعلام نشده چون ملاک نیست؛ قضاوت فقط بر اساس مقایسه چشمی خود دو تصویر است.
 - "very_similar": هم‌خانواده و نزدیک است ولی عین همان قطعه نیست (اختلاف در تعداد دندانه/پره، قطر، طول، عرض یا جزئیات ساختاری).
 - "different": از نظر ظاهری و ساختاری اصلاً همان قطعه نیست.
 
@@ -929,17 +696,13 @@ async function verifySingleCandidate(
 async function confirmExactMatch(
   ai: GoogleGenAI,
   userJpg: Buffer,
-  candJpg: Buffer,
-  stampedCodeHint?: string
+  candJpg: Buffer
 ): Promise<boolean> {
-  const hint = stampedCodeHint
-    ? `
-نکته مهم: روی خود قطعه در تصویر ۱ این کد/عدد خوانده شده است: «${stampedCodeHint}». اگر این کد با کد کاتالوگ این کالا یکی است، این قوی‌ترین مدرک یکسان بودن مدل قطعه است — اما همچنان فرم ظاهری دو تصویر باید یک خانواده و منطبق باشد.`
-    : '';
   const parts: any[] = [
     {
       text: `دو تصویر از قطعات صنعتی دارید: تصویر ۱ عکس واقعی کاربر، تصویر ۲ عکس رسمی یک کالای کاتالوگ.
-آیا جسم فیزیکی در تصویر ۲ دقیقاً همان مدل قطعه در تصویر ۱ است؟ (همان فرم هندسی، همان تعداد دندانه/پره/شیار/سوراخ، همان نسبت‌های ابعادی — فقط زاویه/نور/پس‌زمینه متفاوت است)${hint}
+آیا جسم فیزیکی در تصویر ۲ دقیقاً همان مدل قطعه در تصویر ۱ است؟ (همان فرم هندسی، همان تعداد دندانه/پره/شیار/سوراخ، همان نسبت‌های ابعادی — فقط زاویه/نور/پس‌زمینه متفاوت است)
+قضاوت فقط بر اساس ظاهر خود تصاویر باشد؛ به هیچ اسم، کد یا توضیحی اتکا نکن.
 سخت‌گیر باش: اگر اندازه، تعداد دندانه/پره، ساختار یا جزئیات فرق دارد، جواب false است. اگر مطمئن نیستی، جواب false است.
 پاسخ صرفاً JSON: {"samePhysicalPart": true/false, "reason": "دلیل کوتاه فارسی"}`,
     },
@@ -972,9 +735,7 @@ async function verifyCandidatesVisually(
   userImageMime: string,
   candidates: any[],
   whatYouSee: string,
-  detectedPartType: string,
-  stampedCodeText?: string,
-  stampedCodeItemCodes?: Set<string>
+  detectedPartType: string
 ): Promise<VisualVerificationResponse | null> {
   if (!candidates || candidates.length === 0) return null;
 
@@ -1042,11 +803,7 @@ async function verifyCandidatesVisually(
         confirmed.push({ v, ok: false });
         continue;
       }
-      const hintForCandidate =
-        stampedCodeText && stampedCodeItemCodes?.has((v.candidateCode || '').toLowerCase())
-          ? stampedCodeText
-          : undefined;
-      const ok = await confirmExactMatch(ai, userJpg, p.jpg, hintForCandidate);
+      const ok = await confirmExactMatch(ai, userJpg, p.jpg);
       confirmed.push({ v, ok });
     }
 
@@ -1110,13 +867,7 @@ app.post('/api/ai/analyze-part', async (req, res) => {
     // (works offline too - no API key needed)
     let visualCandidateResult: VisualCandidateResult = { candidates: [], exactVisualMatch: false, bestDistance: 999 };
     if (normalizedImage) {
-      visualCandidateResult = await rankCatalogItemsByVisualAppearance({
-        queryBuffer: normalizedImage.buffer,
-        length: numLength,
-        width: numWidth,
-        pitch: numPitch,
-        topK: 4,
-      });
+      visualCandidateResult = await getVisualCandidateResult(normalizedImage.buffer);
     }
 
     const visualMatches = visualCandidateResult.candidates;
@@ -1133,7 +884,7 @@ app.post('/api/ai/analyze-part', async (req, res) => {
       // detector (user re-uploaded a catalog image). Anything looser than an
       // exact hash hit is NOT proven to be the same part -> custom order.
       const exactHashMatches = (visualCandidateResult.candidates || []).filter(
-        c => c.visualDistance <= VISUAL_EXACT_MAX
+        c => c.visualDistance <= VISUAL_DUPLICATE_MAX
       );
       const noKeyExact = exactHashMatches.length > 0;
 
@@ -1282,82 +1033,36 @@ ${stageInstruction}
       }
     }
 
-    // 1. Candidate Retrieval:
-    // If the user provided an image, RETRIEVE CANDIDATES DIRECTLY BY VISUAL APPEARANCE OF THEIR CATALOG PHOTOS!
+    // 1. Candidate Retrieval — PURE VISUAL:
+    // Rank ALL catalog images by perceptual similarity to the user's photo
+    // (full image + the AI-detected part region cropped out). Names, codes,
+    // categories and dimensions play NO role — that data is unreliable.
     let mergedCandidates: any[] = [];
     let exactVisualMatch = false;
-    let stampedCodeItems: CatalogItem[] = [];
 
     if (normalizedImage) {
-      const detectedStamp = parsedResult.detectedCodeOnPart || parsedResult.suggestedForzaCode || '';
-      const visualRes = await rankCatalogItemsByVisualAppearance({
-        queryBuffer: normalizedImage.buffer,
-        visualShape: parsedResult.visualShape,
-        objectColor: parsedResult.objectColor,
-        detectedCode: detectedStamp,
-        length: numLength,
-        width: numWidth,
-        pitch: numPitch,
-        topK: 8,
-      });
+      // Validate the AI-detected bounding box (normalized 0..1000) first
+      let bboxForRetrieval: NormBox | undefined;
+      const bb0 = parsedResult.boundingBox;
+      if (
+        bb0 &&
+        [bb0.x_min, bb0.y_min, bb0.x_max, bb0.y_max].every((v: any) => typeof v === 'number' && v >= 0 && v <= 1000) &&
+        bb0.x_max > bb0.x_min &&
+        bb0.y_max > bb0.y_min
+      ) {
+        bboxForRetrieval = { x_min: bb0.x_min, y_min: bb0.y_min, x_max: bb0.x_max, y_max: bb0.y_max };
+      }
 
+      const visualRes = await getVisualCandidateResult(normalizedImage.buffer, bboxForRetrieval);
       mergedCandidates = visualRes.candidates;
       exactVisualMatch = visualRes.exactVisualMatch;
-
-      // A code read directly off the physical part is the strongest identity
-      // signal — every catalog item carrying that code is a must-verify
-      // candidate. (Note: catalog data contains some duplicated FORZA codes,
-      // so there can be more than one item per code.)
-      stampedCodeItems = findCatalogItemsByStampedCode(detectedStamp);
-      for (const item of stampedCodeItems.slice(0, 3)) {
-        const itemCodeLower = item.code.toLowerCase();
-        if (!mergedCandidates.some(c => c.code.toLowerCase() === itemCodeLower)) {
-          mergedCandidates.push({
-            code: item.code,
-            name: item.name,
-            forzaCode: item.forzaCode,
-            brand: brandForCatalogItem(item),
-            categorySlug: item.categorySlug,
-            categoryName: item.categoryName,
-            subcategory: item.subcategory,
-            cataloguePage: item.page,
-            image: item.image,
-            similarityScore: 99,
-            matchReason: `🎯 کد خوانده‌شده از روی خود قطعه (${detectedStamp}) با کد رسمی این کالا در کاتالوگ مطابقت دارد`,
-            specs: item.specs && item.specs.length > 0 ? item.specs.slice(0, 4) : [],
-            price: item.price,
-            stock: item.stock,
-            isVisualMatch: true,
-            visualDistance: 999,
-          });
-          console.log(`[AI Search] Injected stamped-code item ${item.code} (code: ${detectedStamp}) into candidates`);
-        }
-      }
-      mergedCandidates = mergedCandidates.slice(0, 8);
-
       console.log(
-        `[AI Search] Visual candidate ranking retrieved ${mergedCandidates.length} items (exactMatch=${exactVisualMatch}, bestDist=${visualRes.bestDistance})`
-      );
-      console.log(
-        `[AI Search] stage=${reqStage} model=${usedModel}`,
-        `| codeOnPart="${parsedResult.detectedCodeOnPart || ''}"`,
-        `| shape=${parsedResult.visualShape || '?'}`,
-        `| stampedCodeHits=${stampedCodeItems.length}`
+        `[AI Search] Pure-visual retrieval: ${mergedCandidates.length} candidates (duplicate=${exactVisualMatch}, bestDist=${visualRes.bestDistance.toFixed(4)})`
       );
     } else {
-      // Fallback to dimensional matching if no image was uploaded
-      mergedCandidates = searchCatalogProducts({
-        partType: parsedResult.detectedPartType,
-        profile: parsedResult.detectedProfile,
-        keywords: parsedResult.searchKeywords || [],
-        suggestedForzaCode: parsedResult.suggestedForzaCode || '',
-        length: numLength,
-        width: numWidth,
-        pitch: numPitch,
-        application,
-        features,
-        limit: 4,
-      });
+      // Without a photo there is nothing visual to match on — catalog text
+      // (names/codes) is unreliable, so no matches are returned at all.
+      mergedCandidates = [];
     }
 
     // 2. Perform Side-by-Side Visual Verification with Gemini Vision on Candidates
@@ -1370,9 +1075,7 @@ ${stageInstruction}
         normalizedImage.mimeType,
         mergedCandidates,
         parsedResult.whatYouSee || '',
-        parsedResult.detectedPartType || '',
-        (parsedResult.detectedCodeOnPart || parsedResult.suggestedForzaCode || '').trim(),
-        new Set(stampedCodeItems.map(i => i.code.toLowerCase()))
+        parsedResult.detectedPartType || ''
       );
     }
 
@@ -1449,7 +1152,12 @@ ${stageInstruction}
     const exactMatches = allProcessed.filter(
       p => p.visualVerdict === 'exact_match' && (p.similarityScore || 0) >= 88
     );
-    const rejectedCandidates = allProcessed.filter(p => p !== undefined && !exactMatches.includes(p));
+    // Genuinely resembling alternatives (NOT the exact part) — shown separately,
+    // clearly labelled. Structurally different items are never sent to the client.
+    const similarCandidates = allProcessed
+      .filter(p => p.visualVerdict === 'very_similar')
+      .sort((a, b) => (b.similarityScore || 0) - (a.similarityScore || 0))
+      .slice(0, 4);
 
     // Sort exact matches by score descending
     exactMatches.sort((a, b) => (b.similarityScore || 0) - (a.similarityScore || 0));
@@ -1490,7 +1198,7 @@ ${stageInstruction}
           : {
               status: 'custom_order_available',
               statusFarsiTitle: 'عین این قطعه در کاتالوگ فعلی موجود نیست — می‌توانیم برایتان بسازیم',
-              statusFarsiMessage: `هوش مصنوعی نوع قطعه را «${parsedResult.detectedPartType || 'قطعه صنعتی'}» تشخیص داد و هیچ‌یک از کالاهای کاتالوگ انطباق صددرصدی با عکس شما نداشت. کارگاه تخصصی هایپر صنعت اطلس توانایی ساخت یا تأمین سفارشی همین قطعه را دارد.`,
+              statusFarsiMessage: `هوش مصنوعی عکس شما را از نظر ظاهری با کالاهای کاتالوگ مقایسه کرد و هیچ‌یک انطباق صددرصدی نداشت.${similarCandidates.length > 0 ? ' شبیه‌ترین گزینه‌ها صرفاً به‌عنوان مرجع در پایین نمایش داده می‌شوند (عین قطعه شما نیستند).' : ''} کارگاه تخصصی هایپر صنعت اطلس توانایی ساخت یا تأمین سفارشی همین قطعه را دارد.`,
             };
       }
     }
@@ -1531,7 +1239,8 @@ ${stageInstruction}
         verifiedCandidateCount: mergedCandidates.length,
       },
       matchedProducts: finalMatches,
-      rejectedCandidates: rejectedCandidates.slice(0, 6),
+      similarCandidates,
+      rejectedCandidates: [],
       technicalAdvice: parsedResult.technicalAdvice || 'قبل از نصب، از هم‌راستایی فولی‌ها و عدم لنگی شفت اطمینان حاصل فرمایید.',
     });
   } catch (error: any) {
@@ -1548,20 +1257,14 @@ ${stageInstruction}
     try {
       const catchImage = await normalizeImageInput(req.body?.imageBase64, req.body?.mimeType);
       if (catchImage) {
-        catchVisualRes = await rankCatalogItemsByVisualAppearance({
-          queryBuffer: catchImage.buffer,
-          length: numLength,
-          width: numWidth,
-          pitch: numPitch,
-          topK: 4,
-        });
+        catchVisualRes = await getVisualCandidateResult(catchImage.buffer);
       }
     } catch {
       // ignore
     }
 
     const catchExact = catchVisualRes.exactVisualMatch;
-    const exactFallback = (catchVisualRes.candidates || []).filter(c => c.visualDistance <= VISUAL_EXACT_MAX);
+    const exactFallback = (catchVisualRes.candidates || []).filter(c => c.visualDistance <= VISUAL_DUPLICATE_MAX);
 
     const mergedFallback = exactFallback.map(m => ({
       ...m,

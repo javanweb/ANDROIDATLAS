@@ -78,7 +78,7 @@ export const AiVisualPartSearchModal: React.FC<Props> = ({ isOpen, onClose }) =>
   const [analysisResult, setAnalysisResult] = useState<AiPartAnalysisResult | null>(null);
   const [errorMessage, setErrorMessage] = useState<string>('');
   const [isDragOver, setIsDragOver] = useState<boolean>(false);
-  const [showRejected, setShowRejected] = useState<boolean>(false);
+  const [showSimilar, setShowSimilar] = useState<boolean>(false);
 
   // Two-stage flow: 'quick' = image-only instant ID, 'refined' = image + dims + application
   const [pendingStage, setPendingStage] = useState<AiAnalysisStage>('refined');
@@ -1342,34 +1342,34 @@ export const AiVisualPartSearchModal: React.FC<Props> = ({ isOpen, onClose }) =>
               </div>
               )}
 
-              {/* Rejected Candidates Transparency Section */}
-              {analysisResult.rejectedCandidates && analysisResult.rejectedCandidates.length > 0 && (
-                <div className="border border-slate-200 rounded-2xl bg-slate-50/70 p-3.5 space-y-2.5">
+              {/* Closest Visual Alternatives — clearly NOT the customer's exact part */}
+              {analysisResult.similarCandidates && analysisResult.similarCandidates.length > 0 && (
+                <div className="border border-amber-200 rounded-2xl bg-amber-50/60 p-3.5 space-y-2.5">
                   <button
                     type="button"
-                    onClick={() => setShowRejected(!showRejected)}
-                    className="w-full flex items-center justify-between text-xs font-bold text-slate-700 hover:text-[#0A172F] cursor-pointer"
+                    onClick={() => setShowSimilar(!showSimilar)}
+                    className="w-full flex items-center justify-between text-xs font-bold text-amber-800 hover:text-amber-950 cursor-pointer"
                   >
                     <span className="flex items-center gap-2">
-                      <Eye className="w-4 h-4 text-slate-500" />
+                      <Eye className="w-4 h-4 text-amber-600" />
                       <span>
-                        کاندیداهای کاتالوگ که با عکس شما مقایسه شدند اما تأیید نشدند (
-                        {toPersianDigits(analysisResult.rejectedCandidates.length)} قلم)
+                        شبیه‌ترین گزینه‌های کاتالوگ — عین قطعه شما نیستند (
+                        {toPersianDigits(analysisResult.similarCandidates.length)} قلم)
                       </span>
                     </span>
-                    <span className="text-[11px] text-slate-500 flex items-center gap-1">
-                      {showRejected ? 'بستن' : 'مشاهده مقایسه AI'}
-                      {showRejected ? <ChevronUp className="w-3.5 h-3.5" /> : <ChevronDown className="w-3.5 h-3.5" />}
+                    <span className="text-[11px] text-amber-700 flex items-center gap-1">
+                      {showSimilar ? 'بستن' : 'مشاهده'}
+                      {showSimilar ? <ChevronUp className="w-3.5 h-3.5" /> : <ChevronDown className="w-3.5 h-3.5" />}
                     </span>
                   </button>
 
-                  {showRejected && (
-                    <div className="pt-2 border-t border-slate-200 space-y-2">
-                      <p className="text-[11px] text-slate-500">
-                        سیستم هوش مصنوعی این قطعات را از نظر تصویر کاتالوگ با عکس شما مقایسه کرد اما به دلیل تفاوت در ساختار یا کارکرد رد کرد تا هیچ‌وقت کالای اشتباه پیشنهاد داده نشود:
+                  {showSimilar && (
+                    <div className="pt-2 border-t border-amber-200 space-y-2">
+                      <p className="text-[11px] text-amber-800 leading-relaxed">
+                        این اقلام از نظر ظاهری نزدیک‌ترین‌ها به عکس شما بودند، اما راستی‌آزمایی چشمی هوش مصنوعی تأیید نکرد که عین قطعه شما باشند؛ صرفاً به‌عنوان مرجع نمایش داده می‌شوند:
                       </p>
                       <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
-                        {analysisResult.rejectedCandidates.map((rej, rIdx) => {
+                        {analysisResult.similarCandidates.map((rej, rIdx) => {
                           const cItem = rej.catalogProduct;
                           const rImg = resolveMatchImage(rej, cItem);
                           return (
@@ -1388,8 +1388,8 @@ export const AiVisualPartSearchModal: React.FC<Props> = ({ isOpen, onClose }) =>
                               <div className="flex-1 min-w-0 space-y-1">
                                 <div className="flex items-center justify-between">
                                   <span className="font-mono text-[10px] text-slate-500 font-bold">{rej.code}</span>
-                                  <span className={`text-[10px] px-1.5 py-0.5 rounded font-bold ${rej.visualVerdict === 'very_similar' ? 'bg-amber-50 text-amber-700' : 'bg-red-50 text-red-700'}`}>
-                                    {rej.visualVerdict === 'very_similar' ? 'نزدیک ولی عین همون نیست' : 'فرق داره'}
+                                  <span className="text-[10px] px-1.5 py-0.5 rounded font-bold bg-amber-100 text-amber-800">
+                                    شبیه است — ولی عین قطعه شما نیست
                                   </span>
                                 </div>
                                 <div className="font-bold text-slate-800 text-[11px] truncate">{rej.name}</div>

@@ -79,7 +79,8 @@ export interface AiPartAnalysisResult {
     verifiedCandidateCount?: number;
   };
   matchedProducts: MatchedPartItem[];
-  rejectedCandidates?: MatchedPartItem[]; // Candidates inspected by AI and marked as 'different'
+  rejectedCandidates?: MatchedPartItem[]; // (legacy, kept empty) items rejected as 'different'
+  similarCandidates?: MatchedPartItem[]; // visually close alternatives — NOT the exact part
   technicalAdvice: string;
   fallbackNotice?: string;
   aiError?: string;
@@ -187,6 +188,9 @@ export const aiVisualSearchService = {
     data.matchedProducts = (data.matchedProducts || []).map(mapWithCatalog);
     if (data.rejectedCandidates && Array.isArray(data.rejectedCandidates)) {
       data.rejectedCandidates = data.rejectedCandidates.map(mapWithCatalog);
+    }
+    if (data.similarCandidates && Array.isArray(data.similarCandidates)) {
+      data.similarCandidates = data.similarCandidates.map(mapWithCatalog);
     }
 
     return data;
