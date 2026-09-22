@@ -171,10 +171,18 @@ interface ImageFeatures {
   col: number[]; // 64-bin RGB color histogram (normalized, sums to 1)
 }
 
-const FEATURE_CACHE_VERSION = 2;
+// Every image is indexed twice: as-is (raw) and background-removed (clean).
+// Distances are only computed between matching variants (raw↔raw, clean↔clean)
+// so a studio catalog shot and a cluttered workshop photo stay comparable.
+interface DualFeatures {
+  raw: ImageFeatures;
+  clean: ImageFeatures;
+}
 
-// filename -> ImageFeatures
-const IMAGE_FEATURE_INDEX = new Map<string, ImageFeatures>();
+const FEATURE_CACHE_VERSION = 4;
+
+// filename -> DualFeatures
+const IMAGE_FEATURE_INDEX = new Map<string, DualFeatures>();
 let visualIndexReady = false;
 
 // ----------------------------------------------------------------------------
@@ -258,7 +266,66 @@ function dctPHash(pixels: Buffer): string {
   return bitsToHex(bits);
 }
 
-// Extract the full pure-visual feature set from an image buffer.
+// Remove a uniform studio/workshop background so the part itself drives the
+// perceptual hashes. Corners are sampled; if they agree on a color, pixels
+// close to it become white and the content is trimmed. Busy backgrounds are
+// left untouched (the AI bounding-box crop already handles those).
+async function removeBackground(buffer: Buffer): Promise<Buffer> {
+  try {
+    const { data, info } = await sharp(buffer)
+      .resize(300, 300, { fit: 'inside', withoutEnlargement: true })
+      .removeAlpha()
+      .raw()
+      .toBuffer({ resolveWithObject: true });
+    const W = info.width;
+    const H = info.height;
+    const px = (x: number, y: number): [number, number, number] => {
+      const i = (y * W + x) * 3;
+      return [data[i], data[i + 1], data[i + 2]];
+    };
+    const corners = [px(1, 1), px(W - 2, 1), px(1, H - 2), px(W - 2, H - 2)];
+    let maxDiff = 0;
+    for (let a = 0; a < 4; a++) {
+      for (let b = a + 1; b < 4; b++) {
+        for (let k = 0; k < 3; k++) {
+          maxDiff = Math.max(maxDiff, Math.abs(corners[a][k] - corners[b][k]));
+        }
+      }
+    }
+    if (maxDiff > 60) return buffer; // varied background — keep original
+
+    const bg: [number, number, number] = [
+      Math.round((corners[0][0] + corners[1][0] + corners[2][0] + corners[3][0]) / 4),
+      Math.round((corners[0][1] + corners[1][1] + corners[2][1] + corners[3][1]) / 4),
+      Math.round((corners[0][2] + corners[1][2] + corners[2][2] + corners[3][2]) / 4),
+    ];
+    const out = Buffer.alloc(W * H * 3);
+    for (let i = 0; i < W * H; i++) {
+      const r = data[i * 3];
+      const g = data[i * 3 + 1];
+      const b = data[i * 3 + 2];
+      const isBg =
+        Math.abs(r - bg[0]) < 42 && Math.abs(g - bg[1]) < 42 && Math.abs(b - bg[2]) < 42;
+      if (isBg) {
+        out[i * 3] = 255;
+        out[i * 3 + 1] = 255;
+        out[i * 3 + 2] = 255;
+      } else {
+        out[i * 3] = r;
+        out[i * 3 + 1] = g;
+        out[i * 3 + 2] = b;
+      }
+    }
+    const flattened = await sharp(out, { raw: { width: W, height: H, channels: 3 } })
+      .png()
+      .toBuffer();
+    return await sharp(flattened).trim({ threshold: 3 }).png().toBuffer().catch(() => flattened);
+  } catch {
+    return buffer;
+  }
+}
+
+// Extract the full pure-visual feature set from an image buffer (as-is).
 async function computeImageFeatures(buffer: Buffer): Promise<ImageFeatures> {
   // 256-bit difference hash (17x16 grayscale)
   const raw17 = await sharp(buffer).resize(17, 16, { fit: 'fill' }).grayscale().raw().toBuffer();
@@ -295,6 +362,14 @@ async function computeImageFeatures(buffer: Buffer): Promise<ImageFeatures> {
   return { dh, ph, ah, col };
 }
 
+// Raw + background-removed features for one image.
+async function computeDualImageFeatures(buffer: Buffer): Promise<DualFeatures> {
+  const raw = await computeImageFeatures(buffer);
+  const cleaned = await removeBackground(buffer);
+  const clean = cleaned === buffer ? raw : await computeImageFeatures(cleaned);
+  return { raw, clean };
+}
+
 function hammingDistance(h1: string, h2: string): number {
   if (!h1 || !h2 || h1.length !== h2.length) return Number.MAX_SAFE_INTEGER;
   let d = 0;
@@ -317,11 +392,14 @@ async function buildImageFeatureIndex(): Promise<void> {
       try {
         const cached = JSON.parse(fs.readFileSync(IMAGE_HASH_CACHE_PATH, 'utf8')) as {
           version: number;
-          entries: Record<string, ImageFeatures>;
+          entries: Record<string, DualFeatures>;
         };
         if (cached && cached.version === FEATURE_CACHE_VERSION && cached.entries) {
           for (const [file, feat] of Object.entries(cached.entries)) {
-            if (feat && typeof feat.dh === 'string' && feat.dh.length === 64 && Array.isArray(feat.col)) {
+            if (
+              feat?.raw && typeof feat.raw.dh === 'string' && feat.raw.dh.length === 64 && Array.isArray(feat.raw.col) &&
+              feat?.clean && typeof feat.clean.dh === 'string' && feat.clean.dh.length === 64 && Array.isArray(feat.clean.col)
+            ) {
               IMAGE_FEATURE_INDEX.set(file, feat);
             }
           }
@@ -340,7 +418,7 @@ async function buildImageFeatureIndex(): Promise<void> {
       if (!fullPath) continue;
       try {
         const buf = fs.readFileSync(fullPath);
-        IMAGE_FEATURE_INDEX.set(file, await computeImageFeatures(buf));
+        IMAGE_FEATURE_INDEX.set(file, await computeDualImageFeatures(buf));
         newlyHashed++;
       } catch {
         // unreadable image -> skip
@@ -433,7 +511,16 @@ function visualFeatureDistance(a: ImageFeatures, b: ImageFeatures): number {
 // PURE VISUAL ranking over all catalog images.
 // No names, no codes, no categories, no dimensions — the catalog text data is
 // currently unreliable, so the ONLY signal is image appearance.
-function rankByVisualFeatures(queryFeatList: ImageFeatures[], topK = 8): VisualCandidateResult {
+// Distance is always computed between matching variants (raw↔raw, clean↔clean)
+// and the best comparable pair wins.
+function dualFeatureDistance(q: DualFeatures, f: DualFeatures): number {
+  return Math.min(
+    visualFeatureDistance(q.raw, f.raw),
+    visualFeatureDistance(q.clean, f.clean)
+  );
+}
+
+function rankByVisualFeatures(queryDualList: DualFeatures[], topK = 14): VisualCandidateResult {
   if (!visualIndexReady || IMAGE_FEATURE_INDEX.size === 0 || !CATALOG_ITEMS || CATALOG_ITEMS.length === 0) {
     return { candidates: [], exactVisualMatch: false, bestDistance: 999 };
   }
@@ -442,24 +529,38 @@ function rankByVisualFeatures(queryFeatList: ImageFeatures[], topK = 8): VisualC
   const scored = CATALOG_ITEMS.map(item => {
     const f = item.image ? IMAGE_FEATURE_INDEX.get(item.image) : undefined;
     let dist = 999;
-    if (f && queryFeatList.length > 0) {
-      dist = Math.min(...queryFeatList.map(q => visualFeatureDistance(q, f)));
+    let rawDist = 999;
+    if (f && queryDualList.length > 0) {
+      dist = Math.min(...queryDualList.map(q => dualFeatureDistance(q, f)));
+      rawDist = Math.min(...queryDualList.map(q => visualFeatureDistance(q.raw, f.raw)));
     }
     if (dist < minDistance) minDistance = dist;
-    return { item, distance: dist };
+    return { item, distance: dist, rawDistance: rawDist };
   });
 
-  scored.sort((a, b) => a.distance - b.distance);
+  // Two recall paths:
+  //  1) best combined (raw/clean) distance — favors clean catalog shots
+  //  2) best raw-only distance — protects busy workshop photos whose
+  //     background removal did not trigger
+  const byCombined = [...scored].sort((a, b) => a.distance - b.distance);
+  const byRaw = [...scored].sort((a, b) => a.rawDistance - b.rawDistance);
 
   // Deduplicate by image so candidates represent distinct catalog photos
   const seenImages = new Set<string>();
   const distinctCandidates: typeof scored = [];
-  for (const s of scored) {
+  for (const s of byCombined.slice(0, Math.min(8, topK))) {
     const img = (s.item.image || '').trim();
     if (!seenImages.has(img)) {
       seenImages.add(img);
       distinctCandidates.push(s);
-      if (distinctCandidates.length >= topK) break;
+    }
+  }
+  for (const s of byRaw.slice(0, 6)) {
+    if (distinctCandidates.length >= topK) break;
+    const img = (s.item.image || '').trim();
+    if (!seenImages.has(img)) {
+      seenImages.add(img);
+      distinctCandidates.push(s);
     }
   }
 
@@ -514,9 +615,9 @@ async function getVisualCandidateResult(queryBuffer: Buffer, boundingBox?: NormB
   if (!visualIndexReady || IMAGE_FEATURE_INDEX.size === 0 || !CATALOG_ITEMS || CATALOG_ITEMS.length === 0) {
     return { candidates: [], exactVisualMatch: false, bestDistance: 999 };
   }
-  const featList: ImageFeatures[] = [];
+  const dualList: DualFeatures[] = [];
   try {
-    featList.push(await computeImageFeatures(queryBuffer));
+    dualList.push(await computeDualImageFeatures(queryBuffer));
   } catch (err) {
     console.error('[Visual Retrieval] feature extraction failed:', err);
     return { candidates: [], exactVisualMatch: false, bestDistance: 999 };
@@ -524,12 +625,12 @@ async function getVisualCandidateResult(queryBuffer: Buffer, boundingBox?: NormB
   if (boundingBox) {
     try {
       const cropped = await cropToBoundingBox(queryBuffer, boundingBox);
-      featList.push(await computeImageFeatures(cropped));
+      dualList.push(await computeDualImageFeatures(cropped));
     } catch {
       // cropping is best-effort
     }
   }
-  return rankByVisualFeatures(featList);
+  return rankByVisualFeatures(dualList);
 }
 
 // Normalize any image input (data-URL, raw base64, or remote http URL) into
@@ -701,9 +802,10 @@ async function confirmExactMatch(
   const parts: any[] = [
     {
       text: `دو تصویر از قطعات صنعتی دارید: تصویر ۱ عکس واقعی کاربر، تصویر ۲ عکس رسمی یک کالای کاتالوگ.
-آیا جسم فیزیکی در تصویر ۲ دقیقاً همان مدل قطعه در تصویر ۱ است؟ (همان فرم هندسی، همان تعداد دندانه/پره/شیار/سوراخ، همان نسبت‌های ابعادی — فقط زاویه/نور/پس‌زمینه متفاوت است)
+آیا در تصویر ۲ همان مدل محصولی دیده می‌شود که در تصویر ۱ هست؟
+منظو از «همان مدل» این است که طراحی و ساختار کلی (فرم هندسی، الگوی پره/دندانه/شیار، نوع اتصالات، نسبت‌های کلی) یکی باشد؛ زاویه دوربین، نور، پس‌زمینه، کیفیت عکس و میزان ساییدگی/کهنگی می‌تواند متفاوت باشد و مانع تشخیص نیست.
 قضاوت فقط بر اساس ظاهر خود تصاویر باشد؛ به هیچ اسم، کد یا توضیحی اتکا نکن.
-سخت‌گیر باش: اگر اندازه، تعداد دندانه/پره، ساختار یا جزئیات فرق دارد، جواب false است. اگر مطمئن نیستی، جواب false است.
+اگر طراحی یا ساختار قطعه واقعاً فرق دارد (مثلاً تعداد پره‌ها یا نوع دندانه متفاوت است)، جواب false است. اگر شک داری، جواب false است.
 پاسخ صرفاً JSON: {"samePhysicalPart": true/false, "reason": "دلیل کوتاه فارسی"}`,
     },
     { inlineData: { mimeType: 'image/jpeg', data: userJpg.toString('base64') } },
@@ -721,6 +823,42 @@ async function confirmExactMatch(
     );
     const parsed = JSON.parse(stripJsonFences(text));
     return parsed?.samePhysicalPart === true;
+  } catch {
+    return false;
+  }
+}
+
+// Third independent vote used when the first verification says "exact" but the
+// second opinion disagrees. Two of three votes win.
+async function tieBreakExactMatch(
+  ai: GoogleGenAI,
+  userJpg: Buffer,
+  candJpg: Buffer
+): Promise<boolean> {
+  const parts: any[] = [
+    {
+      text: `تصویر ۱: عکس واقعی یک قطعه صنعتی که کاربر فرستاده (ممکن است زاویه، نور و پس‌زمینه غیرحرفه‌ای داشته باشد).
+تصویر ۲: عکس رسمی یک محصول در کاتالوگ فروشگاه.
+سؤال: آیا تصویر ۲ همان مدل محصول تصویر ۱ است؟ (یعنی اگر مشتری این را سفارش دهد، همان چیزی می‌گیرد که در عکس خودش دارد)
+معیار: طراحی، فرم و ساختار قطعه در دو عکس باید یکی باشد؛ تفاوت‌های زاویه، نور، رنگ پس‌زمینه، ساییدگی و کیفیت عکس جزئی و طبیعی است و رد نمی‌کند.
+اگر ساختار یا طراحی متفاوت است (تعداد پره/دندانه/شیار یا فرم کلی دیگر)، false بده. شک داری = false.
+پاسخ صرفاً JSON: {"sameProductModel": true/false, "reason": "دلیل کوتاه فارسی"}`,
+    },
+    { inlineData: { mimeType: 'image/jpeg', data: userJpg.toString('base64') } },
+    { inlineData: { mimeType: 'image/jpeg', data: candJpg.toString('base64') } },
+  ];
+
+  try {
+    const { text } = await generateWithModelCascade(
+      ai,
+      [{ role: 'user', parts }],
+      { responseMimeType: 'application/json' },
+      'Tie Break',
+      VERIFICATION_MODELS,
+      25000
+    );
+    const parsed = JSON.parse(stripJsonFences(text));
+    return parsed?.sameProductModel === true;
   } catch {
     return false;
   }
@@ -753,7 +891,7 @@ async function verifyCandidatesVisually(
       if (!key || seenCodes.has(key)) return false;
       seenCodes.add(key);
       return true;
-    }).slice(0, 8);
+    }).slice(0, 14);
 
     // 3. Load + resize candidate images (aliases resolved)
     const prepared: { cand: any; jpg: Buffer }[] = [];
@@ -809,12 +947,46 @@ async function verifyCandidatesVisually(
 
     for (const { v, ok } of confirmed) {
       if (!ok) {
-        console.log(`[Visual Verification] Second opinion REJECTED exact claim for ${v.candidateCode} — downgraded to very_similar`);
-        v.verdict = 'very_similar';
-        v.matchScore = Math.min(v.matchScore, 87);
-        v.visualExplanation = v.visualExplanation
-          ? `${v.visualExplanation} (راستی‌آزمایی دوم، قطعیت انطباق را تأیید نکرد — به‌عنوان مشابه دسته‌بندی شد)`
-          : 'راستی‌آزمایی دوم، قطعیت انطباق را تأیید نکرد — به‌عنوان مشابه دسته‌بندی شد';
+        // Disagreement -> third independent vote (2 of 3 win)
+        const p = prepared.find(x => x.cand.code === v.candidateCode);
+        const tie = p ? await tieBreakExactMatch(ai, userJpg, p.jpg) : false;
+        if (tie) {
+          console.log(`[Visual Verification] Tie-break CONFIRMED exact match for ${v.candidateCode} (2 of 3 votes)`);
+        } else {
+          console.log(`[Visual Verification] Second opinion + tie-break rejected exact claim for ${v.candidateCode} — downgraded to very_similar`);
+          v.verdict = 'very_similar';
+          v.matchScore = Math.min(v.matchScore, 87);
+          v.visualExplanation = v.visualExplanation
+            ? `${v.visualExplanation} (راستی‌آزمایی تکمیلی، قطعیت انطباق را تأیید نکرد — به‌عنوان مشابه دسته‌بندی شد)`
+            : 'راستی‌آزمایی تکمیلی، قطعیت انطباق را تأیید نکرد — به‌عنوان مشابه دسته‌بندی شد';
+        }
+      }
+    }
+
+    // Rank-1 retrieval candidate with a near-miss verdict gets one arbitration
+    // vote. Weaker models are occasionally too strict about angle/lighting on
+    // the true match, so strong retrieval evidence (clearly the closest catalog
+    // image) lowers the score threshold for asking the arbitrator.
+    const rank1 = verdicts.find(v => v.candidateCode === (prepared[0]?.cand.code || ''));
+    if (rank1 && rank1.verdict === 'very_similar') {
+      const rank1Dist = prepared[0]?.cand?.visualDistance ?? 999;
+      const rank2Dist = prepared[1]?.cand?.visualDistance ?? 999;
+      const margin = rank2Dist - rank1Dist;
+      const strongRetrieval = rank1Dist <= 0.35 || margin >= 0.03;
+      const threshold = strongRetrieval ? 70 : 80;
+      if (rank1.matchScore >= threshold) {
+        const tie = await tieBreakExactMatch(ai, userJpg, prepared[0].jpg);
+        if (tie) {
+          console.log(
+            `[Visual Verification] Rank-1 arbitration CONFIRMED exact match for ${rank1.candidateCode} (score=${rank1.matchScore}, dist=${rank1Dist}, margin=${margin.toFixed(3)})`
+          );
+          rank1.verdict = 'exact_match';
+          rank1.matchScore = Math.max(rank1.matchScore, 90);
+        } else {
+          console.log(
+            `[Visual Verification] Rank-1 arbitration rejected exact match for ${rank1.candidateCode} (score=${rank1.matchScore}, dist=${rank1Dist})`
+          );
+        }
       }
     }
 
