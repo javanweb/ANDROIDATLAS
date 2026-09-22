@@ -3,6 +3,7 @@ import path from 'path';
 import fs from 'fs';
 import dotenv from 'dotenv';
 import sharp from 'sharp';
+import type { OverlayOptions } from 'sharp';
 import { GoogleGenAI } from '@google/genai';
 import { createServer as createViteServer } from 'vite';
 
@@ -179,11 +180,181 @@ interface DualFeatures {
   clean: ImageFeatures;
 }
 
-const FEATURE_CACHE_VERSION = 4;
+const FEATURE_CACHE_VERSION = 5;
 
 // filename -> DualFeatures
 const IMAGE_FEATURE_INDEX = new Map<string, DualFeatures>();
 let visualIndexReady = false;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// JINA DEEP VISUAL EMBEDDINGS (jina-embeddings-v5-omni-small)
+// A second, deep-learning retrieval channel: every catalog image and the
+// customer photo are embedded into a shared 1024-dim space; cosine similarity
+// captures overall shape & appearance ("شکل و شمایل چشمی") far better than
+// perceptual hashes when lighting/angle/background differ.
+// The index is cached in src/data/imageEmbeddings.json (864 entries).
+// ─────────────────────────────────────────────────────────────────────────────
+const JINA_API_KEY = (process.env.JINA_API_KEY || '').trim();
+const JINA_EMB_MODEL = 'jina-embeddings-v5-omni-small';
+const IMAGE_EMB_CACHE_PATH = path.join(process.cwd(), 'src', 'data', 'imageEmbeddings.json');
+const IMAGE_EMB_CACHE_VERSION = 1;
+
+// filename -> number[] (1024 dims, normalized by Jina)
+const IMAGE_EMB_INDEX = new Map<string, number[]>();
+let embIndexReady = false;
+
+function cosineSimilarity(a: number[], b: number[]): number {
+  if (!a || !b || a.length !== b.length) return -1;
+  let dot = 0;
+  let na = 0;
+  let nb = 0;
+  for (let i = 0; i < a.length; i++) {
+    dot += a[i] * b[i];
+    na += a[i] * a[i];
+    nb += b[i] * b[i];
+  }
+  if (na === 0 || nb === 0) return -1;
+  return dot / Math.sqrt(na * nb);
+}
+
+async function jinaFetchWithTimeout(url: string, body: any, timeoutMs = 20000): Promise<any> {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+  try {
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${JINA_API_KEY}` },
+      body: JSON.stringify(body),
+      signal: ctrl.signal,
+    });
+    const json = await res.json().catch(() => null);
+    if (!res.ok || !json) {
+      throw new Error(`Jina API ${res.status}: ${JSON.stringify(json || {}).slice(0, 120)}`);
+    }
+    return json;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+// Embed images (as data URIs) with the Jina multimodal embedding model.
+// Batches of 8; returns one 1024-dim vector per input buffer (null on failure).
+async function jinaEmbedImages(buffers: Buffer[], task: 'retrieval.query' | 'retrieval.passage'): Promise<(number[] | null)[]> {
+  if (!JINA_API_KEY || buffers.length === 0) return buffers.map(() => null);
+  const out: (number[] | null)[] = buffers.map(() => null);
+  const BATCH = 8;
+  for (let off = 0; off < buffers.length; off += BATCH) {
+    const chunk = buffers.slice(off, off + BATCH);
+    const input: any[] = [];
+    const okIdx: number[] = [];
+    for (let i = 0; i < chunk.length; i++) {
+      try {
+        const jpg = await sharp(chunk[i])
+          .resize(224, 224, { fit: 'inside' })
+          .flatten({ background: '#ffffff' })
+          .jpeg({ quality: 80 })
+          .toBuffer();
+        input.push({ image: 'data:image/jpeg;base64,' + jpg.toString('base64') });
+        okIdx.push(i);
+      } catch {
+        // unprocessable image -> stays null
+      }
+    }
+    if (input.length === 0) continue;
+    let json: any = null;
+    for (let attempt = 0; attempt < 2 && !json; attempt++) {
+      try {
+        json = await jinaFetchWithTimeout('https://api.jina.ai/v1/embeddings', {
+          model: JINA_EMB_MODEL,
+          task,
+          dimensions: 1024,
+          input,
+        });
+      } catch (err: any) {
+        if (attempt === 1) console.log(`[Jina Embed] batch failed: ${err?.message?.slice(0, 90)}`);
+        else await new Promise(r => setTimeout(r, 500));
+      }
+    }
+    if (!json || !Array.isArray(json.data)) continue;
+    const embeddings = json.data.map((d: any) => (d?.embedding as number[]) || null);
+    for (let k = 0; k < okIdx.length && k < embeddings.length; k++) {
+      out[off + okIdx[k]] = embeddings[k];
+    }
+  }
+  return out;
+}
+
+// Load the catalog embedding cache; build it in the background when missing
+// and a Jina key is configured.
+async function buildImageEmbeddingIndex(): Promise<void> {
+  try {
+    if (fs.existsSync(IMAGE_EMB_CACHE_PATH)) {
+      const cached = JSON.parse(fs.readFileSync(IMAGE_EMB_CACHE_PATH, 'utf8')) as {
+        version: number;
+        model: string;
+        entries: Record<string, number[]>;
+      };
+      if (cached && cached.version === IMAGE_EMB_CACHE_VERSION && cached.entries) {
+        for (const [img, emb] of Object.entries(cached.entries)) {
+          if (Array.isArray(emb) && emb.length === 1024) IMAGE_EMB_INDEX.set(img, emb);
+        }
+      }
+    }
+    embIndexReady = IMAGE_EMB_INDEX.size > 0;
+    console.log(
+      `[Server] Jina embedding index: ${IMAGE_EMB_INDEX.size} catalog images` +
+        (JINA_API_KEY ? '' : ' (no JINA_API_KEY — query-side embeddings disabled)')
+    );
+
+    // Background build for any catalog image missing from the cache
+    if (JINA_API_KEY) {
+      const missing = CATALOG_ITEMS.filter(
+        it => (it.image || '').trim() && !IMAGE_EMB_INDEX.has((it.image || '').trim())
+      );
+      if (missing.length > 0) {
+        console.log(`[Server] Building Jina embeddings for ${missing.length} catalog images (background)...`);
+        (async () => {
+          try {
+            const files: string[] = [];
+            const bufs: Buffer[] = [];
+            for (const item of missing) {
+              const file = (item.image || '').trim();
+              const fullPath = resolveCatalogImagePath(file);
+              if (!fullPath) continue;
+              try {
+                bufs.push(fs.readFileSync(fullPath));
+                files.push(file);
+              } catch {
+                // unreadable
+              }
+            }
+            const embeddings = await jinaEmbedImages(bufs, 'retrieval.passage');
+            let built = 0;
+            for (let i = 0; i < files.length; i++) {
+              if (embeddings[i]) {
+                IMAGE_EMB_INDEX.set(files[i], embeddings[i] as number[]);
+                built++;
+              }
+            }
+            if (built > 0) {
+              embIndexReady = IMAGE_EMB_INDEX.size > 0;
+              fs.writeFileSync(
+                IMAGE_EMB_CACHE_PATH,
+                JSON.stringify({ version: IMAGE_EMB_CACHE_VERSION, model: JINA_EMB_MODEL, entries: Object.fromEntries(IMAGE_EMB_INDEX) })
+              );
+              console.log(`[Server] Jina embedding index updated: +${built} (total ${IMAGE_EMB_INDEX.size})`);
+            }
+          } catch (e: any) {
+            console.error('[Server] Jina embedding background build failed:', e?.message);
+          }
+        })();
+      }
+    }
+  } catch (e: any) {
+    console.error('[Server] Jina embedding index failed (channel disabled):', e?.message);
+    embIndexReady = false;
+  }
+}
 
 // ----------------------------------------------------------------------------
 // Catalog image filename resolver.
@@ -266,11 +437,18 @@ function dctPHash(pixels: Buffer): string {
   return bitsToHex(bits);
 }
 
-// Remove a uniform studio/workshop background so the part itself drives the
-// perceptual hashes. Corners are sampled; if they agree on a color, pixels
-// close to it become white and the content is trimmed. Busy backgrounds are
-// left untouched (the AI bounding-box crop already handles those).
-async function removeBackground(buffer: Buffer): Promise<Buffer> {
+// Remove a uniform-ish studio/workshop background using border-seeded
+// flood fill. Robust against gradients and watermark noise, unlike a single
+// global background color. Returns the cleaned image plus the part mask.
+interface CleanResult {
+  cleaned: Buffer;
+  mask: Uint8Array | null; // 1 = part pixel (at 300px working resolution)
+  colHistogram: number[] | null; // 64-bin RGB histogram over PART pixels only
+  width: number;
+  height: number;
+}
+
+async function cleanImage(buffer: Buffer): Promise<CleanResult> {
   try {
     const { data, info } = await sharp(buffer)
       .resize(300, 300, { fit: 'inside', withoutEnlargement: true })
@@ -279,49 +457,129 @@ async function removeBackground(buffer: Buffer): Promise<Buffer> {
       .toBuffer({ resolveWithObject: true });
     const W = info.width;
     const H = info.height;
-    const px = (x: number, y: number): [number, number, number] => {
-      const i = (y * W + x) * 3;
-      return [data[i], data[i + 1], data[i + 2]];
-    };
-    const corners = [px(1, 1), px(W - 2, 1), px(1, H - 2), px(W - 2, H - 2)];
-    let maxDiff = 0;
-    for (let a = 0; a < 4; a++) {
-      for (let b = a + 1; b < 4; b++) {
-        for (let k = 0; k < 3; k++) {
-          maxDiff = Math.max(maxDiff, Math.abs(corners[a][k] - corners[b][k]));
-        }
-      }
-    }
-    if (maxDiff > 60) return buffer; // varied background — keep original
+    const idx = (x: number, y: number) => (y * W + x) * 3;
 
-    const bg: [number, number, number] = [
-      Math.round((corners[0][0] + corners[1][0] + corners[2][0] + corners[3][0]) / 4),
-      Math.round((corners[0][1] + corners[1][1] + corners[2][1] + corners[3][1]) / 4),
-      Math.round((corners[0][2] + corners[1][2] + corners[2][2] + corners[3][2]) / 4),
-    ];
+    // border seed statistics
+    const borderIdx: number[] = [];
+    for (let x = 0; x < W; x += 3) {
+      borderIdx.push(idx(x, 0), idx(x, H - 1));
+    }
+    for (let y = 0; y < H; y += 3) {
+      borderIdx.push(idx(0, y), idx(W - 1, y));
+    }
+    const mean = [0, 1, 2].map(k => {
+      let s = 0;
+      for (const i of borderIdx) s += data[i + k];
+      return s / borderIdx.length;
+    });
+    let variance = 0;
+    for (const i of borderIdx) {
+      for (let k = 0; k < 3; k++) variance += (data[i + k] - mean[k]) ** 2;
+    }
+    variance /= borderIdx.length * 3;
+
+    // genuinely busy/scene-like border -> no backdrop to remove
+    if (variance > 3000) {
+      return { cleaned: buffer, mask: null, colHistogram: null, width: W, height: H };
+    }
+
+    const bg = new Uint8Array(W * H);
+    const queue: number[] = [];
+    const LOCAL_T = 42;   // neighbor continuity (handles gradients)
+    const GLOBAL_T = 110; // vs border mean (limits runaway growth)
+    const closePair = (i: number, j: number) =>
+      Math.abs(data[i] - data[j]) < LOCAL_T &&
+      Math.abs(data[i + 1] - data[j + 1]) < LOCAL_T &&
+      Math.abs(data[i + 2] - data[j + 2]) < LOCAL_T;
+    const closeMean = (i: number) =>
+      Math.abs(data[i] - mean[0]) < GLOBAL_T &&
+      Math.abs(data[i + 1] - mean[1]) < GLOBAL_T &&
+      Math.abs(data[i + 2] - mean[2]) < GLOBAL_T;
+    const push = (x: number, y: number) => {
+      const p = y * W + x;
+      if (!bg[p]) {
+        bg[p] = 1;
+        queue.push(p);
+      }
+    };
+    for (let x = 0; x < W; x++) {
+      if (closeMean(idx(x, 0))) push(x, 0);
+      if (closeMean(idx(x, H - 1))) push(x, H - 1);
+    }
+    for (let y = 0; y < H; y++) {
+      if (closeMean(idx(0, y))) push(0, y);
+      if (closeMean(idx(W - 1, y))) push(W - 1, y);
+    }
+    while (queue.length) {
+      const p = queue.pop() as number;
+      const x = p % W;
+      const y = (p - x) / W;
+      const i = p * 3;
+      const tryN = (nx: number, ny: number) => {
+        if (nx < 0 || ny < 0 || nx >= W || ny >= H) return;
+        const np = ny * W + nx;
+        if (bg[np]) return;
+        const ni = np * 3;
+        if (closePair(i, ni) && closeMean(ni)) {
+          bg[np] = 1;
+          queue.push(np);
+        }
+      };
+      tryN(x + 1, y);
+      tryN(x - 1, y);
+      tryN(x, y + 1);
+      tryN(x, y - 1);
+    }
+
+    let bgCount = 0;
+    for (let p = 0; p < W * H; p++) bgCount += bg[p];
+    // flood filled almost nothing -> no backdrop
+    if (bgCount < 0.08 * W * H) {
+      return { cleaned: buffer, mask: null, colHistogram: null, width: W, height: H };
+    }
+
     const out = Buffer.alloc(W * H * 3);
-    for (let i = 0; i < W * H; i++) {
-      const r = data[i * 3];
-      const g = data[i * 3 + 1];
-      const b = data[i * 3 + 2];
-      const isBg =
-        Math.abs(r - bg[0]) < 42 && Math.abs(g - bg[1]) < 42 && Math.abs(b - bg[2]) < 42;
-      if (isBg) {
-        out[i * 3] = 255;
-        out[i * 3 + 1] = 255;
-        out[i * 3 + 2] = 255;
+    for (let p = 0; p < W * H; p++) {
+      if (bg[p]) {
+        out[p * 3] = 255;
+        out[p * 3 + 1] = 255;
+        out[p * 3 + 2] = 255;
       } else {
-        out[i * 3] = r;
-        out[i * 3 + 1] = g;
-        out[i * 3 + 2] = b;
+        out[p * 3] = data[p * 3];
+        out[p * 3 + 1] = data[p * 3 + 1];
+        out[p * 3 + 2] = data[p * 3 + 2];
       }
     }
-    const flattened = await sharp(out, { raw: { width: W, height: H, channels: 3 } })
+    const mask = new Uint8Array(W * H);
+    for (let p = 0; p < W * H; p++) mask[p] = bg[p] ? 0 : 1;
+
+    // Color histogram over PART pixels only — after we whitewash the
+    // backdrop, a full-image histogram would be dominated by white and
+    // lose all color discrimination between light-colored parts.
+    const colHist = new Array(64).fill(0);
+    let partPixels = 0;
+    for (let p = 0; p < W * H; p++) {
+      if (!mask[p]) continue;
+      partPixels++;
+      const i = p * 3;
+      const r = Math.min(3, data[i] >> 6);
+      const g = Math.min(3, data[i + 1] >> 6);
+      const b = Math.min(3, data[i + 2] >> 6);
+      colHist[r * 16 + g * 4 + b]++;
+    }
+    const colHistogram = partPixels >= 300 ? colHist.map(v => v / partPixels) : null;
+
+    const flat = await sharp(out, { raw: { width: W, height: H, channels: 3 } })
       .png()
       .toBuffer();
-    return await sharp(flattened).trim({ threshold: 3 }).png().toBuffer().catch(() => flattened);
+    const cleaned = await sharp(flat)
+      .trim({ threshold: 3 })
+      .png()
+      .toBuffer()
+      .catch(() => flat);
+    return { cleaned, mask, colHistogram, width: W, height: H };
   } catch {
-    return buffer;
+    return { cleaned: buffer, mask: null, colHistogram: null, width: 0, height: 0 };
   }
 }
 
@@ -365,8 +623,14 @@ async function computeImageFeatures(buffer: Buffer): Promise<ImageFeatures> {
 // Raw + background-removed features for one image.
 async function computeDualImageFeatures(buffer: Buffer): Promise<DualFeatures> {
   const raw = await computeImageFeatures(buffer);
-  const cleaned = await removeBackground(buffer);
-  const clean = cleaned === buffer ? raw : await computeImageFeatures(cleaned);
+  const { cleaned, colHistogram } = await cleanImage(buffer);
+  if (cleaned === buffer || !colHistogram) {
+    return { raw, clean: raw };
+  }
+  const clean = await computeImageFeatures(cleaned);
+  // Replace the whole-image histogram with the part-only histogram so the
+  // white backdrop we just painted does not wash out the color signal.
+  clean.col = colHistogram;
   return { raw, clean };
 }
 
@@ -449,6 +713,7 @@ async function buildImageFeatureIndex(): Promise<void> {
 
 // Build in background so server startup isn't blocked on first run
 void buildImageFeatureIndex();
+void buildImageEmbeddingIndex();
 
 function brandForCatalogItem(item: CatalogItem): string {
   const itemName = item.name.toLowerCase();
@@ -484,10 +749,21 @@ interface VisualMatch {
 // feature-distance scale, near-duplicates land well below 0.07.
 const VISUAL_DUPLICATE_MAX = 0.07;
 
+interface RankedItemRef {
+  code: string;
+  image: string;
+  distance: number;
+  colDistance: number;
+}
+
 interface VisualCandidateResult {
-  candidates: (VisualMatch & { visualDistance: number; isVisualMatch: true })[];
+  candidates: (VisualMatch & { visualDistance: number; isVisualMatch: true; embSim?: number })[];
   exactVisualMatch: boolean;
   bestDistance: number;
+  rankedCombined: RankedItemRef[];
+  rankedCol: RankedItemRef[];
+  rankedRaw: RankedItemRef[];
+  rankedEmb: RankedItemRef[];
 }
 
 interface NormBox {
@@ -495,6 +771,14 @@ interface NormBox {
   y_min: number;
   x_max: number;
   y_max: number;
+}
+
+// Pure color-distribution distance (0..1). Works on part-only histograms for
+// the clean variant, so it compares "what color is the part itself".
+function colFeatureDistance(a: ImageFeatures, b: ImageFeatures): number {
+  let l1 = 0;
+  for (let i = 0; i < 64; i++) l1 += Math.abs(a.col[i] - b.col[i]);
+  return Math.min(1, l1 / 2);
 }
 
 // Weighted combination of perceptual distances (each normalized 0..1).
@@ -520,35 +804,101 @@ function dualFeatureDistance(q: DualFeatures, f: DualFeatures): number {
   );
 }
 
-function rankByVisualFeatures(queryDualList: DualFeatures[], topK = 14): VisualCandidateResult {
+function rankByVisualFeatures(
+  queryDualList: DualFeatures[],
+  queryEmbs: (number[] | null)[] = [],
+  topK = 14
+): VisualCandidateResult {
   if (!visualIndexReady || IMAGE_FEATURE_INDEX.size === 0 || !CATALOG_ITEMS || CATALOG_ITEMS.length === 0) {
-    return { candidates: [], exactVisualMatch: false, bestDistance: 999 };
+    return { candidates: [], exactVisualMatch: false, bestDistance: 999, rankedCombined: [], rankedCol: [], rankedRaw: [], rankedEmb: [] };
   }
 
+  const hasEmb = embIndexReady && IMAGE_EMB_INDEX.size > 0 && queryEmbs.some(e => Array.isArray(e) && e.length === 1024);
   let minDistance = 999;
   const scored = CATALOG_ITEMS.map(item => {
     const f = item.image ? IMAGE_FEATURE_INDEX.get(item.image) : undefined;
     let dist = 999;
     let rawDist = 999;
+    let colDist = 999;
     if (f && queryDualList.length > 0) {
       dist = Math.min(...queryDualList.map(q => dualFeatureDistance(q, f)));
       rawDist = Math.min(...queryDualList.map(q => visualFeatureDistance(q.raw, f.raw)));
+      // Pure color-of-the-part distance (clean variant carries the
+      // part-only histogram when background removal succeeded).
+      colDist = Math.min(...queryDualList.map(q => Math.min(
+        colFeatureDistance(q.clean, f.clean),
+        colFeatureDistance(q.raw, f.raw)
+      )));
+    }
+    // Deep visual embedding similarity (Jina v5-omni): captures overall shape
+    // & appearance; robust to lighting/angle/background differences.
+    let embSim = -1;
+    if (hasEmb) {
+      const cat = item.image ? IMAGE_EMB_INDEX.get((item.image || '').trim()) : undefined;
+      if (cat) {
+        for (const qe of queryEmbs) {
+          if (!qe) continue;
+          const s = cosineSimilarity(qe, cat);
+          if (s > embSim) embSim = s;
+        }
+      }
     }
     if (dist < minDistance) minDistance = dist;
-    return { item, distance: dist, rawDistance: rawDist };
+    return { item, distance: dist, rawDistance: rawDist, colDistance: colDist, embSim };
   });
 
-  // Two recall paths:
+  // Three recall paths:
   //  1) best combined (raw/clean) distance — favors clean catalog shots
   //  2) best raw-only distance — protects busy workshop photos whose
   //     background removal did not trigger
+  //  3) best part-color distance — shape hashes fail when the catalog photo
+  //     shows the same part differently (stacked vs single), color survives
   const byCombined = [...scored].sort((a, b) => a.distance - b.distance);
   const byRaw = [...scored].sort((a, b) => a.rawDistance - b.rawDistance);
+  const byCol = [...scored].sort((a, b) => a.colDistance - b.colDistance);
+  const byEmb = hasEmb
+    ? [...scored].filter(s => s.embSim >= 0).sort((a, b) => b.embSim - a.embSim)
+    : [];
 
-  // Deduplicate by image so candidates represent distinct catalog photos
+  // Full ranked lists (for the AI catalog-browsing montage round)
+  const toRef = (s: (typeof scored)[number]): RankedItemRef => ({
+    code: s.item.code,
+    image: (s.item.image || '').trim(),
+    distance: Number(s.distance.toFixed(4)),
+    colDistance: Number(s.colDistance.toFixed(4)),
+  });
+  const rankedCombined = byCombined.slice(0, 120).map(toRef);
+  const rankedCol = byCol.slice(0, 120).map(toRef);
+  const rankedRaw = byRaw.slice(0, 120).map(toRef);
+  const rankedEmb = byEmb.slice(0, 120).map(s => ({
+    code: s.item.code,
+    image: (s.item.image || '').trim(),
+    distance: Number((1 - s.embSim).toFixed(4)),
+    colDistance: Number(s.colDistance.toFixed(4)),
+  }));
+
+  // Deduplicate by image so candidates represent distinct catalog photos.
+  // The deep-embedding path is included because it recognizes the same part
+  // under very different lighting/scene conditions where hashes fail.
   const seenImages = new Set<string>();
   const distinctCandidates: typeof scored = [];
   for (const s of byCombined.slice(0, Math.min(8, topK))) {
+    const img = (s.item.image || '').trim();
+    if (!seenImages.has(img)) {
+      seenImages.add(img);
+      distinctCandidates.push(s);
+    }
+  }
+  for (const s of byEmb.slice(0, 8)) {
+    if (distinctCandidates.length >= topK) break;
+    const img = (s.item.image || '').trim();
+    if (!seenImages.has(img)) {
+      seenImages.add(img);
+      distinctCandidates.push(s);
+    }
+  }
+  for (const s of byCol.slice(0, 6)) {
+    if (distinctCandidates.length >= topK) break;
     const img = (s.item.image || '').trim();
     if (!seenImages.has(img)) {
       seenImages.add(img);
@@ -566,7 +916,7 @@ function rankByVisualFeatures(queryDualList: DualFeatures[], topK = 14): VisualC
 
   const exactVisualMatch = minDistance <= VISUAL_DUPLICATE_MAX;
 
-  const candidates: (VisualMatch & { visualDistance: number; isVisualMatch: true })[] = distinctCandidates.map(({ item, distance }) => ({
+  const candidates: (VisualMatch & { visualDistance: number; isVisualMatch: true; embSim?: number })[] = distinctCandidates.map(({ item, distance, embSim }) => ({
     code: item.code,
     name: item.name,
     forzaCode: item.forzaCode,
@@ -586,9 +936,10 @@ function rankByVisualFeatures(queryDualList: DualFeatures[], topK = 14): VisualC
     stock: item.stock,
     isVisualMatch: true as const,
     visualDistance: Number(distance.toFixed(4)),
+    embSim,
   }));
 
-  return { candidates, exactVisualMatch, bestDistance: minDistance };
+  return { candidates, exactVisualMatch, bestDistance: minDistance, rankedCombined, rankedCol, rankedRaw, rankedEmb };
 }
 
 // Crop the user's photo to the AI-detected part region (with a small margin)
@@ -613,14 +964,14 @@ async function cropToBoundingBox(buffer: Buffer, bb: NormBox, padRatio = 0.08): 
 // against each catalog image wins.
 async function getVisualCandidateResult(queryBuffer: Buffer, boundingBox?: NormBox): Promise<VisualCandidateResult> {
   if (!visualIndexReady || IMAGE_FEATURE_INDEX.size === 0 || !CATALOG_ITEMS || CATALOG_ITEMS.length === 0) {
-    return { candidates: [], exactVisualMatch: false, bestDistance: 999 };
+    return { candidates: [], exactVisualMatch: false, bestDistance: 999, rankedCombined: [], rankedCol: [], rankedRaw: [], rankedEmb: [] };
   }
   const dualList: DualFeatures[] = [];
   try {
     dualList.push(await computeDualImageFeatures(queryBuffer));
   } catch (err) {
     console.error('[Visual Retrieval] feature extraction failed:', err);
-    return { candidates: [], exactVisualMatch: false, bestDistance: 999 };
+    return { candidates: [], exactVisualMatch: false, bestDistance: 999, rankedCombined: [], rankedCol: [], rankedRaw: [], rankedEmb: [] };
   }
   if (boundingBox) {
     try {
@@ -630,7 +981,26 @@ async function getVisualCandidateResult(queryBuffer: Buffer, boundingBox?: NormB
       // cropping is best-effort
     }
   }
-  return rankByVisualFeatures(dualList);
+  // Deep embedding of the same query variants (full + cropped). Degrades to
+  // hash-only retrieval when the Jina key is absent or the API is down.
+  const queryEmbs: (number[] | null)[] = [];
+  if (embIndexReady && JINA_API_KEY) {
+    try {
+      const embBufs = [queryBuffer];
+      if (dualList.length > 1 && boundingBox) {
+        try {
+          embBufs.push(await cropToBoundingBox(queryBuffer, boundingBox));
+        } catch {
+          // cropped variant is best-effort
+        }
+      }
+      const embs = await jinaEmbedImages(embBufs, 'retrieval.query');
+      queryEmbs.push(...embs);
+    } catch (err: any) {
+      console.log('[Visual Retrieval] Jina query embedding failed (hash-only):', err?.message?.slice(0, 80));
+    }
+  }
+  return rankByVisualFeatures(dualList, queryEmbs);
 }
 
 // Normalize any image input (data-URL, raw base64, or remote http URL) into
@@ -864,6 +1234,221 @@ async function tieBreakExactMatch(
   }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// AI CATALOG BROWSING (montage round)
+// When the first verification finds no exact match, global image features may
+// simply be too polluted (busy workshop scenes, wild lighting) to rank the
+// true part in the top-14. Instead of giving up, we let Gemini visually SCAN
+// a much wider slice of the catalog: 8x8 grids of numbered thumbnails built
+// from the best raw / color / combined ranked lists. The model picks items
+// that are the same product or the same visual family; those picks then go
+// through the normal one-by-one verification.
+// ─────────────────────────────────────────────────────────────────────────────
+
+const MONTAGE_GRID_COLS = 8;
+const MONTAGE_GRID_ROWS = 8;
+const MONTAGE_CELL_PX = 130;
+const MONTAGE_POOL_MAX = 128;
+const MONTAGE_PICKS_MAX = 8;
+
+function catalogItemByCodeRef(code: string): CatalogItem | null {
+  const needle = code.trim().toLowerCase();
+  for (const item of CATALOG_ITEMS) {
+    if ((item.code || '').trim().toLowerCase() === needle) return item;
+  }
+  return null;
+}
+
+// Build the montage browsing pool from the retrieval ranked lists:
+// shape (raw) gets the deepest slice because shape survives lighting changes,
+// then part-color, then the blended distance. Already-verified candidates
+// (the top union pool) are excluded — they had their chance.
+function buildMontagePool(
+  visualRes: VisualCandidateResult,
+  excludeCodes: Set<string>
+): RankedItemRef[] {
+  const pool: RankedItemRef[] = [];
+  const seen = new Set<string>(excludeCodes);
+  const push = (r: RankedItemRef | undefined) => {
+    if (!r || !r.code || pool.length >= MONTAGE_POOL_MAX) return;
+    const key = r.code.trim().toLowerCase();
+    if (seen.has(key)) return;
+    seen.add(key);
+    pool.push(r);
+  };
+  for (let i = 0; i < 64 && pool.length < MONTAGE_POOL_MAX; i++) {
+    push(visualRes.rankedRaw?.[i]);
+    if (i < 48) push(visualRes.rankedCol?.[i]);
+    if (i < 48) push(visualRes.rankedEmb?.[i]);
+    if (i < 32) push(visualRes.rankedCombined?.[i]);
+  }
+  return pool;
+}
+
+// Render one 8x8 numbered grid of catalog thumbnails as a JPEG buffer.
+async function renderMontageGrid(refs: RankedItemRef[]): Promise<Buffer> {
+  const W = MONTAGE_GRID_COLS * MONTAGE_CELL_PX;
+  const H = MONTAGE_GRID_ROWS * MONTAGE_CELL_PX;
+  const comps: OverlayOptions[] = [];
+  let badges = '';
+  for (let i = 0; i < refs.length && i < MONTAGE_GRID_COLS * MONTAGE_GRID_ROWS; i++) {
+    const col = i % MONTAGE_GRID_COLS;
+    const row = Math.floor(i / MONTAGE_GRID_COLS);
+    const x = col * MONTAGE_CELL_PX;
+    const y = row * MONTAGE_CELL_PX;
+    const imgPath = resolveCatalogImagePath(refs[i].image);
+    if (imgPath) {
+      try {
+        const thumb = await sharp(imgPath)
+          .resize(MONTAGE_CELL_PX - 2, MONTAGE_CELL_PX - 2, { fit: 'inside' })
+          .flatten({ background: '#ffffff' })
+          .png()
+          .toBuffer();
+        comps.push({ input: thumb, left: x + 1, top: y + 1 });
+      } catch {
+        // unreadable cell -> left blank
+      }
+    }
+    badges +=
+      `<rect x="${x + 2}" y="${y + 2}" width="34" height="24" fill="#ffffff" stroke="#000000" stroke-width="1.5" rx="3"/>` +
+      `<text x="${x + 19}" y="${y + 20}" font-family="Arial, Helvetica, sans-serif" font-size="15" font-weight="bold" fill="#000000" text-anchor="middle">${i + 1}</text>`;
+  }
+  const overlay = Buffer.from(
+    `<svg width="${W}" height="${H}" xmlns="http://www.w3.org/2000/svg">${badges}</svg>`
+  );
+  comps.push({ input: overlay, left: 0, top: 0 });
+  return sharp({ create: { width: W, height: H, channels: 3, background: '#f0f0f0' } })
+    .composite(comps)
+    .jpeg({ quality: 82 })
+    .toBuffer();
+}
+
+// One Gemini call per grid: the model browses the grid next to the user photo
+// and returns the numbered cells that are the same product / same family.
+async function browseOneMontageGrid(
+  ai: GoogleGenAI,
+  userJpg: Buffer,
+  gridJpg: Buffer,
+  cellCount: number,
+  whatYouSee: string,
+  detectedPartType: string
+): Promise<{ n: number; kind: string }[]> {
+  const parts: any[] = [
+    {
+      text: `تصویر شماره ۱: عکس واقعی ارسالی مشتری از یک قطعه صنعتی (ممکن است در کارگاه، با نور و زاویه نامناسب گرفته شده باشد).
+توضیح مشتری/هوش مصنوعی از قطعه: ${whatYouSee || detectedPartType || 'قطعه صنعتی'}
+
+تصویر شماره ۲: شبکه ${MONTAGE_GRID_ROWS}×${MONTAGE_GRID_COLS} از عکس‌های رسمی کاتالوگ هایپر صنعت اطلس — هر خانه یک کالا و شماره خانه در گوشه بالا-چپ همان خانه نوشته شده (۱ تا ${cellCount}).
+
+وظیفه تو: مثل یک کارشناس، کاتالوگ را «چشمی» مرور کن و خانه‌هایی را پیدا کن که محصول آن خانه از نظر ظاهری به قطعه تصویر ۱ مربوط است:
+- "same_product": عین همان مدل است — طراحی، فرم هندسی، الگوی دندانه/شیار/پره و نسبت‌ها کاملاً منطبق (زاویه، نور، رنگ نورپردازی و پس‌زمینه می‌تواند فرق کند).
+- "same_family": هم‌نوع و هم‌خانواده ظاهری است (هر دو مثلاً واشر تخت‌اند، هر دو تسمه‌اند، هر دو پولی‌اند...) ولی عین همان مدل نیست.
+- اگر خانه‌ای هیچ ربط ظاهری به قطعه نداشت، اصلاً در پاسخ نیاور.
+
+قوانین:
+(۱) فقط و فقط بر اساس مقایسه چشمی خود تصاویر قضاوت کن؛ هیچ اسم و کد و توضیحی ملاک نیست.
+(۲) شماره خانه‌ها را دقیق بخوان و فقط شماره‌های معتبر بین ۱ تا ${cellCount} بده.
+(۳) حداکثر ۶ خانه انتخاب کن. اگر هیچ خانه‌ای نزدیک نبود، آرایه خالی بده — چیزی را از سر بابت نچین.
+
+پاسخ صرفاً JSON معتبر:
+{"picks": [{"n": <شماره خانه>, "kind": "same_product" | "same_family"}]}`,
+    },
+    { inlineData: { mimeType: 'image/jpeg', data: userJpg.toString('base64') } },
+    { inlineData: { mimeType: 'image/jpeg', data: gridJpg.toString('base64') } },
+  ];
+
+  try {
+    const { text, model } = await generateWithModelCascade(
+      ai,
+      [{ role: 'user', parts }],
+      { responseMimeType: 'application/json' },
+      'Montage Browse',
+      GEMINI_MODELS,
+      45000
+    );
+    const parsed = JSON.parse(stripJsonFences(text));
+    const picksRaw = Array.isArray(parsed?.picks) ? parsed.picks : [];
+    const picks = picksRaw
+      .map((p: any) => ({ n: Math.round(Number(p?.n)), kind: String(p?.kind || 'same_family') }))
+      .filter((p: any) => Number.isFinite(p.n) && p.n >= 1 && p.n <= cellCount && (p.kind === 'same_product' || p.kind === 'same_family'))
+      .slice(0, 6);
+    console.log(`[Montage Browse] model=${model} picks=${JSON.stringify(picks)}`);
+    return picks;
+  } catch (err: any) {
+    console.log(`[Montage Browse] grid call failed: ${err?.message?.slice(0, 90)}`);
+    return [];
+  }
+}
+
+// Full montage round: build pool -> render grids -> browse -> map picks to
+// catalog candidate objects (ready for one-by-one verification).
+async function montageBrowseCatalog(
+  ai: GoogleGenAI,
+  userImageBuffer: Buffer,
+  whatYouSee: string,
+  detectedPartType: string,
+  visualRes: VisualCandidateResult,
+  excludeCodes: Set<string>
+): Promise<any[]> {
+  const pool = buildMontagePool(visualRes, excludeCodes);
+  if (pool.length === 0) return [];
+  console.log(`[AI Search] Montage catalog browsing over ${pool.length} items (deeper ranked lists)...`);
+
+  const userJpg = await sharp(userImageBuffer)
+    .resize(480, 480, { fit: 'inside' })
+    .jpeg({ quality: 85 })
+    .toBuffer();
+
+  const perGrid = MONTAGE_GRID_COLS * MONTAGE_GRID_ROWS;
+  const pickedRefs: { ref: RankedItemRef; kind: string }[] = [];
+  const pickedCodes = new Set<string>(excludeCodes);
+  for (let g = 0; g * perGrid < pool.length && pickedRefs.length < MONTAGE_PICKS_MAX; g++) {
+    const chunk = pool.slice(g * perGrid, (g + 1) * perGrid);
+    const gridJpg = await renderMontageGrid(chunk);
+    const picks = await browseOneMontageGrid(ai, userJpg, gridJpg, chunk.length, whatYouSee, detectedPartType);
+    for (const p of picks) {
+      const ref = chunk[p.n - 1];
+      if (!ref) continue;
+      const key = ref.code.trim().toLowerCase();
+      if (pickedCodes.has(key)) continue;
+      pickedCodes.add(key);
+      pickedRefs.push({ ref, kind: p.kind });
+      if (pickedRefs.length >= MONTAGE_PICKS_MAX) break;
+    }
+  }
+  if (pickedRefs.length === 0) return [];
+
+  // Map picked refs to full candidate objects (same shape as retrieval candidates)
+  const candidates: any[] = [];
+  for (const { ref, kind } of pickedRefs) {
+    const item = catalogItemByCodeRef(ref.code);
+    if (!item) continue;
+    candidates.push({
+      code: item.code,
+      name: item.name,
+      forzaCode: item.forzaCode,
+      brand: brandForCatalogItem(item),
+      categorySlug: item.categorySlug,
+      categoryName: item.categoryName,
+      subcategory: item.subcategory,
+      cataloguePage: item.page,
+      image: item.image,
+      similarityScore: 55,
+      matchReason:
+        kind === 'same_product'
+          ? '🎯 انتخاب هوش مصنوعی هنگام مرور چشمی کاتالوگ (ادعای هم‌مدل — در حال راستی‌آزمایی)'
+          : '⚡ انتخاب هوش مصنوعی هنگام مرور چشمی کاتالوگ (هم‌خانواده ظاهری — در حال راستی‌آزمایی)',
+      specs: [],
+      price: item.price,
+      stock: item.stock,
+      isVisualMatch: true,
+      visualDistance: 999,
+      montagePicked: true,
+    });
+  }
+  return candidates;
+}
+
 // Side-by-side visual comparison between real-world photo and official catalog photos.
 // Verifies up to 8 candidates, each in its own parallel AI call, then double-checks
 // every claimed exact match with an independent second opinion.
@@ -1037,7 +1622,7 @@ app.post('/api/ai/analyze-part', async (req, res) => {
 
     // Direct visual search: is this EXACT product photo already on the site?
     // (works offline too - no API key needed)
-    let visualCandidateResult: VisualCandidateResult = { candidates: [], exactVisualMatch: false, bestDistance: 999 };
+    let visualCandidateResult: VisualCandidateResult = { candidates: [], exactVisualMatch: false, bestDistance: 999, rankedCombined: [], rankedCol: [], rankedRaw: [], rankedEmb: [] };
     if (normalizedImage) {
       visualCandidateResult = await getVisualCandidateResult(normalizedImage.buffer);
     }
@@ -1212,6 +1797,7 @@ ${stageInstruction}
     // categories and dimensions play NO role — that data is unreliable.
     let mergedCandidates: any[] = [];
     let exactVisualMatch = false;
+    let visualRes: VisualCandidateResult | null = null;
 
     if (normalizedImage) {
       // Validate the AI-detected bounding box (normalized 0..1000) first
@@ -1226,7 +1812,7 @@ ${stageInstruction}
         bboxForRetrieval = { x_min: bb0.x_min, y_min: bb0.y_min, x_max: bb0.x_max, y_max: bb0.y_max };
       }
 
-      const visualRes = await getVisualCandidateResult(normalizedImage.buffer, bboxForRetrieval);
+      visualRes = await getVisualCandidateResult(normalizedImage.buffer, bboxForRetrieval);
       mergedCandidates = visualRes.candidates;
       exactVisualMatch = visualRes.exactVisualMatch;
       console.log(
@@ -1250,6 +1836,61 @@ ${stageInstruction}
         parsedResult.whatYouSee || '',
         parsedResult.detectedPartType || ''
       );
+    }
+
+    // 2b. AI CATALOG BROWSING (montage round). When the first verification
+    // found no exact match, the retrieval features were probably polluted by
+    // the customer's workshop scene. Let Gemini visually scan a much wider
+    // slice of the catalog in 8x8 thumbnail grids and pick same-product /
+    // same-family items; the picks are then verified one-by-one like any
+    // other candidate, so nothing unverified can reach the customer.
+    if (
+      normalizedImage &&
+      visualRes &&
+      !exactVisualMatch &&
+      !(verificationResponse?.candidateVerdicts || []).some(v => v.verdict === 'exact_match')
+    ) {
+      try {
+        const excludeCodes = new Set<string>(
+          mergedCandidates.map((m: any) => String(m.code || '').trim().toLowerCase()).filter(Boolean)
+        );
+        const montagePicks = await montageBrowseCatalog(
+          ai,
+          normalizedImage.buffer,
+          parsedResult.whatYouSee || '',
+          parsedResult.detectedPartType || '',
+          visualRes,
+          excludeCodes
+        );
+        if (montagePicks.length > 0) {
+          console.log(
+            `[AI Search] Montage browsing picked ${montagePicks.length} extra candidates: ${montagePicks.map((p: any) => p.code).join(', ')}`
+          );
+          const montageVerification = await verifyCandidatesVisually(
+            ai,
+            normalizedImage.buffer,
+            normalizedImage.mimeType,
+            montagePicks,
+            parsedResult.whatYouSee || '',
+            parsedResult.detectedPartType || ''
+          );
+          if (montageVerification) {
+            mergedCandidates = [...mergedCandidates, ...montagePicks];
+            const priorVerdicts = verificationResponse?.candidateVerdicts || [];
+            const allVerdicts = [...priorVerdicts, ...montageVerification.candidateVerdicts];
+            verificationResponse = {
+              candidateVerdicts: allVerdicts,
+              catalogAvailability: allVerdicts.some(v => v.verdict === 'exact_match')
+                ? montageVerification.catalogAvailability
+                : verificationResponse?.catalogAvailability || montageVerification.catalogAvailability,
+            };
+          }
+        } else {
+          console.log('[AI Search] Montage browsing found no additional candidates.');
+        }
+      } catch (mErr: any) {
+        console.warn('[AI Search] Montage catalog browsing failed (non-fatal):', mErr?.message || mErr);
+      }
     }
 
     // Map candidate verdicts
@@ -1298,13 +1939,24 @@ ${stageInstruction}
           distinction: v.visualExplanation || (idx === 1 ? 'مدل جایگزین استاندارد در کاتالوگ اطلس' : 'منطبق بر مشخصات'),
         };
       }
+      // No verdict (online verification unavailable for this candidate):
+      // fall back to the deep-embedding similarity as the best available
+      // visual signal. Items the embedding model does not consider a close
+      // visual match are NOT shown to the customer as similar products.
+      const embSim = typeof m.embSim === 'number' ? m.embSim : -1;
+      const embScore = embSim >= 0.9 ? Math.min(92, Math.round(embSim * 100)) : null;
       return {
         ...m,
+        similarityScore: embScore ?? m.similarityScore ?? 75,
         visualVerdict: 'very_similar' as 'exact_match' | 'very_similar' | 'different',
         visualVerdictFarsi: 'شبیهه (مدل مشابه استاندارد)',
-        visualExplanation: 'بر اساس تشابه مشخصات فنی در کاتالوگ اطلس',
-        verificationConfidence: m.similarityScore || 75,
+        visualExplanation:
+          embScore !== null
+            ? 'شبیه‌ترین کالا از نظر موتور بینایی عمیق (شباهت ظاهری بالا)'
+            : 'بر اساس تشابه مشخصات فنی در کاتالوگ اطلس',
+        verificationConfidence: embScore ?? m.similarityScore ?? 75,
         distinction: idx === 1 ? 'مدل جایگزین استاندارد در کاتالوگ اطلس' : 'منطبق بر مشخصات',
+        unverified: true,
       };
     });
 
@@ -1328,7 +1980,16 @@ ${stageInstruction}
     // Genuinely resembling alternatives (NOT the exact part) — shown separately,
     // clearly labelled. Structurally different items are never sent to the client.
     const similarCandidates = allProcessed
-      .filter(p => p.visualVerdict === 'very_similar')
+      .filter(p => {
+        if (p.visualVerdict !== 'very_similar') return false;
+        // Verified by the online vision model -> trusted similar item.
+        if (!p.unverified) return true;
+        // AI picked it while browsing the catalog montage -> trusted lead.
+        if (p.montagePicked) return true;
+        // Otherwise require a confident deep-embedding similarity so we never
+        // show unrelated products as "similar" (e.g. non-industrial photos).
+        return typeof p.embSim === 'number' && p.embSim >= 0.9;
+      })
       .sort((a, b) => (b.similarityScore || 0) - (a.similarityScore || 0))
       .slice(0, 4);
 
@@ -1429,7 +2090,7 @@ ${stageInstruction}
 
     console.error('[AI Search] Falling back to offline exact-visual matching:', error?.message, error?.aiDetail || '');
 
-    let catchVisualRes: VisualCandidateResult = { candidates: [], exactVisualMatch: false, bestDistance: 999 };
+    let catchVisualRes: VisualCandidateResult = { candidates: [], exactVisualMatch: false, bestDistance: 999, rankedCombined: [], rankedCol: [], rankedRaw: [], rankedEmb: [] };
     try {
       const catchImage = await normalizeImageInput(req.body?.imageBase64, req.body?.mimeType);
       if (catchImage) {
@@ -1450,12 +2111,45 @@ ${stageInstruction}
       visualExplanation: 'تصویر ارسالی شما عیناً با تصویر این کالا در کاتالوگ مطابقت دارد.',
     }));
 
+    // Offline similar-tier: even without the online AI, the visual retrieval
+    // engine (perceptual hashes + deep embeddings) can rank the catalog by
+    // visual appearance. Show the closest items as orderable similar cards
+    // so the customer still gets «این ...ها را داریم» instead of nothing.
+    // Order by deep-embedding similarity first (the strongest visual signal),
+    // falling back to blended hash distance for items without embeddings.
+    const embRankMap = new Map(
+      (catchVisualRes.rankedEmb || []).map((r, i) => [String(r.code || '').trim().toLowerCase(), i])
+    );
+    const similarFallback = (catchVisualRes.candidates || [])
+      .filter(c => (c.visualDistance ?? 999) > VISUAL_DUPLICATE_MAX)
+      .sort((a, b) => {
+        const ra = embRankMap.get(String(a.code || '').trim().toLowerCase()) ?? 9999;
+        const rb = embRankMap.get(String(b.code || '').trim().toLowerCase()) ?? 9999;
+        if (ra !== rb) return ra - rb;
+        return (a.visualDistance ?? 999) - (b.visualDistance ?? 999);
+      })
+      // Only items the deep-embedding model considers a close visual match —
+      // anything else (e.g. a photo that is not an industrial part) gets the
+      // honest "not in catalog, we can build it" answer instead of noise.
+      .filter(c => typeof c.embSim === 'number' && c.embSim >= 0.9)
+      .slice(0, 4)
+      .map(m => ({
+        ...m,
+        similarityScore: Math.min(92, Math.round((m.embSim as number) * 100)),
+        visualVerdict: 'very_similar' as const,
+        visualVerdictFarsi: 'شبیهه (مدل مشابه استاندارد)',
+        visualExplanation: 'شبیه‌ترین کالای کاتالوگ از نظر ظاهر (موتور بینایی عمیق)',
+        distinction: 'شبیه‌ترین کالای کاتالوگ از نظر ظاهری',
+      }));
+
     return res.json({
       success: true,
       isAiGenerated: false,
       stage: reqStage,
       fallbackNotice: catchExact
         ? 'تحلیل کامل هوش مصنوعی موقتاً در دسترس نبود؛ تطابق تصویری دقیق (عین عکس کاتالوگ) انجام شد.'
+        : similarFallback.length > 0
+        ? 'تحلیل کامل هوش مصنوعی موقتاً در دسترس نبود؛ شبیه‌ترین کالاهای کاتالوگ از نظر ظاهری (موتور تطبیق تصویری آفلاین) نمایش داده شد.'
         : 'تحلیل کامل هوش مصنوعی موقتاً در دسترس نبود و موتور تطبیق تصویری آفلاین هیچ انطباق قطعی با کاتالوگ پیدا نکرد.',
       summary: {
         detectedPartType: catchExact ? mergedFallback[0].name : 'قطعه تخصصی صنعتی خطوط تولید',
@@ -1466,6 +2160,8 @@ ${stageInstruction}
             : 'قطعه خارج از کاتالوگ فعلی',
         visualAnalysis: catchExact
           ? 'عکس ارسالی شما عیناً با تصویر یکی از کالاهای سایت مطابقت دارد و همان محصول در صدر نتایج نمایش داده شد.'
+          : similarFallback.length > 0
+          ? 'تحلیل بصری آفلاین انجام شد؛ عین این قطعه به‌صورت قطعی در کاتالوگ تأیید نشد، اما شبیه‌ترین کالاهای کاتالوگ از نظر ظاهری در بخش مشابه‌ها نمایش داده شد.'
           : 'تحلیل بصری آفلاین انجام شد و هیچ انطباق قطعی با کالاهای کاتالوگ یافت نشد؛ عین این قطعه در کاتالوگ فعلی موجود نیست.',
         confidence: catchExact ? 99 : 55,
         exactVisualMatch: catchExact,
@@ -1476,10 +2172,13 @@ ${stageInstruction}
             : 'عین این قطعه در کاتالوگ فعلی موجود نیست — می‌توانیم برایتان بسازیم',
           statusFarsiMessage: catchExact
             ? 'تصویر ارسالی عیناً با عکس ثبت‌شده این کالا در کاتالوگ اطلس مطابقت دارد.'
+            : similarFallback.length > 0
+            ? 'عینِ همین قطعه به‌صورت قطعی تأیید نشد؛ اما شبیه‌ترین کالاهای کاتالوگ از نظر ظاهری در بخش مشابه‌ها قابل سفارش هستند. اگر عین همین قطعه را می‌خواهید، کارگاه تخصصی هایپر صنعت اطلس توانایی ساخت یا تأمین سفارشی آن را دارد.'
             : 'هیچ انطباق قطعی با کالاهای کاتالوگ یافت نشد؛ کارگاه تخصصی هایپر صنعت اطلس توانایی ساخت یا تأمین سفارشی همین قطعه را دارد.',
         },
       },
       matchedProducts: mergedFallback,
+      similarCandidates: similarFallback,
       rejectedCandidates: [],
       technicalAdvice: 'برای تضمین دقت عملکرد، قبل از ثبت سفارش ابعاد و فاصله مراکز پولی را مجدداً اندازه‌گیری نمایید.',
     });
