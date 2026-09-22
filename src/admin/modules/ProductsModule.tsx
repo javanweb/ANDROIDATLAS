@@ -38,8 +38,9 @@ export const ProductsModule: React.FC<ProductsModuleProps> = ({ onQuickImportCli
   const [selectedCategory, setSelectedCategory] = useState('all');
   const [selectedBrand, setSelectedBrand] = useState('all');
   const [stockFilter, setStockFilter] = useState<'all' | 'in_stock' | 'out_of_stock' | 'inquiry'>('all');
+  const [verificationFilter, setVerificationFilter] = useState<'all' | 'catalog_verified' | 'visual_matched' | 'semantic_ai' | 'needs_review'>('all');
   const [currentPage, setCurrentPage] = useState(1);
-  const itemsPerPage = 8;
+  const [itemsPerPage, setItemsPerPage] = useState(12);
 
   // Modals state
   const [isProductModalOpen, setIsProductModalOpen] = useState(false);
@@ -70,12 +71,17 @@ export const ProductsModule: React.FC<ProductsModuleProps> = ({ onQuickImportCli
     description: string;
     tags: string;
     imageUrl: string;
+    catalogPage?: number;
+    catalogItemNumber?: number;
+    matchedCatalogCode?: string;
+    verificationStatus: 'catalog_verified' | 'visual_matched' | 'semantic_ai' | 'needs_review';
+    matchConfidence: number;
     specs: { key: string; value: string }[];
   }>({
     code: '',
     name: '',
-    category: 'industrial-belts',
-    subcategory: 'تسمه V-Belt ساده و دنده‌ای',
+    category: 'belts-power-transmission',
+    subcategory: 'تسمه تایم',
     brand: 'SWR',
     basePrice: 1000000,
     retailPrice: 1350000,
@@ -86,7 +92,12 @@ export const ProductsModule: React.FC<ProductsModuleProps> = ({ onQuickImportCli
     unit: 'حلقه',
     description: '',
     tags: 'صنعتی, پرفروش, ضدسایش',
-    imageUrl: 'https://images.unsplash.com/photo-1581092160607-ee22621dd758?w=800&q=80',
+    imageUrl: '',
+    catalogPage: 1,
+    catalogItemNumber: 1,
+    matchedCatalogCode: '',
+    verificationStatus: 'catalog_verified',
+    matchConfidence: 95,
     specs: [
       { key: 'مقاومت حرارتی', value: 'منفی ۲۰ تا مثبت ۱۱۰ درجه سانتی‌گراد' },
       { key: 'پروفیل و گام', value: 'دنده‌ای صنعتی DIN 7753' },
@@ -103,16 +114,30 @@ export const ProductsModule: React.FC<ProductsModuleProps> = ({ onQuickImportCli
     const matchesSearch =
       p.name.toLowerCase().includes(searchQuery.toLowerCase()) ||
       p.code.toLowerCase().includes(searchQuery.toLowerCase()) ||
-      p.brand.toLowerCase().includes(searchQuery.toLowerCase());
-    const matchesCat = selectedCategory === 'all' || p.category === selectedCategory;
-    const matchesBrand = selectedBrand === 'all' || p.brand.toLowerCase().includes(selectedBrand.toLowerCase());
+      (p.brand && p.brand.toLowerCase().includes(searchQuery.toLowerCase())) ||
+      (p.matchedCatalogCode && p.matchedCatalogCode.toLowerCase().includes(searchQuery.toLowerCase()));
+    
+    const matchesCat =
+      selectedCategory === 'all' ||
+      p.categorySlug === selectedCategory ||
+      p.categoryName === selectedCategory ||
+      p.category === selectedCategory;
+
+    const matchesBrand =
+      selectedBrand === 'all' ||
+      (p.brand && p.brand.toLowerCase().includes(selectedBrand.toLowerCase()));
     
     let matchesStock = true;
     if (stockFilter === 'in_stock') matchesStock = p.stock > 0;
     if (stockFilter === 'out_of_stock') matchesStock = p.stock === 0;
-    if (stockFilter === 'inquiry') matchesStock = !!p.isInquiryOnly;
+    if (stockFilter === 'inquiry') matchesStock = !!(p.isInquiryOnly || p.inquiryOnly);
 
-    return matchesSearch && matchesCat && matchesBrand && matchesStock;
+    let matchesVerification = true;
+    if (verificationFilter !== 'all') {
+      matchesVerification = p.verificationStatus === verificationFilter;
+    }
+
+    return matchesSearch && matchesCat && matchesBrand && matchesStock && matchesVerification;
   });
 
   const totalPages = Math.ceil(filteredProducts.length / itemsPerPage) || 1;
@@ -124,8 +149,8 @@ export const ProductsModule: React.FC<ProductsModuleProps> = ({ onQuickImportCli
     setFormData({
       code: randomCode,
       name: '',
-      category: 'industrial-belts',
-      subcategory: 'تسمه V-Belt ساده و دنده‌ای',
+      category: 'belts-power-transmission',
+      subcategory: 'تسمه تایم',
       brand: 'SWR',
       basePrice: 1200000,
       retailPrice: 1620000,
@@ -136,7 +161,12 @@ export const ProductsModule: React.FC<ProductsModuleProps> = ({ onQuickImportCli
       unit: 'حلقه',
       description: 'تسمه صنعتی با مقاومت کششی بسیار بالا و استاندارد DIN آلمان، مناسب برای مصارف صنعتی و کارخانجات.',
       tags: 'پرفروش, صنعتی, آلمان',
-      imageUrl: 'https://images.unsplash.com/photo-1581092160607-ee22621dd758?w=800&q=80',
+      imageUrl: '',
+      catalogPage: 1,
+      catalogItemNumber: 1,
+      matchedCatalogCode: randomCode,
+      verificationStatus: 'catalog_verified',
+      matchConfidence: 95,
       specs: [
         { key: 'مقاومت حرارتی', value: '-۲۰ تا ۱۱۰ درجه' },
         { key: 'استاندارد ساخت', value: 'DIN 7753 / ISO 4184' },
@@ -164,14 +194,27 @@ export const ProductsModule: React.FC<ProductsModuleProps> = ({ onQuickImportCli
       wholesalePrice: product.prices.wholesale,
       agencyPrice: (product.prices as any).dealer || (product.prices as any).agency || 0,
       stock: product.stock,
-      isInquiryOnly: !!product.inquiryOnly,
+      isInquiryOnly: !!(product.inquiryOnly || product.isInquiryOnly),
       unit: product.unit || 'عدد',
       description: product.description || '',
       tags: (product.tags || []).join(', '),
-      imageUrl: (product.images && product.images[0]) || 'https://images.unsplash.com/photo-1581092160607-ee22621dd758?w=800&q=80',
+      imageUrl: product.image || (product.images && product.images[0]) || '',
+      catalogPage: product.catalogPage || 1,
+      catalogItemNumber: product.catalogItemNumber || 1,
+      matchedCatalogCode: product.matchedCatalogCode || product.code,
+      verificationStatus: product.verificationStatus || 'catalog_verified',
+      matchConfidence: product.matchConfidence || 95,
       specs: specEntries.length > 0 ? specEntries : [{ key: 'جنس روکش', value: 'پلی‌یورتان ضدسایش' }],
     });
     setIsProductModalOpen(true);
+  };
+
+  const handleResetCatalog = () => {
+    if (window.confirm('آیا مایلید تمام ۸۶۴ کالای سیستم با اطلاعات دقیق استخراج‌شده از کاتالوگ و تصاویر واقعی بازنشانی شوند؟')) {
+      const refreshed = adminService.resetToVerifiedCatalog();
+      setProducts(refreshed);
+      setCurrentPage(1);
+    }
   };
 
   const handleRecalculatePrices = (base: number) => {
@@ -198,8 +241,8 @@ export const ProductsModule: React.FC<ProductsModuleProps> = ({ onQuickImportCli
     const productPayload: Product = {
       code: formData.code.trim().toUpperCase(),
       name: formData.name.trim(),
-      categorySlug: formData.category || 'industrial-belts',
-      categoryName: categories.find(c => c.slug === formData.category)?.name || 'تسمه‌های صنعتی',
+      categorySlug: formData.category || 'belts-power-transmission',
+      categoryName: categories.find(c => c.slug === formData.category)?.name || 'تسمه و انتقال نیرو',
       subcategory: formData.subcategory,
       brand: formData.brand,
       prices: {
@@ -207,13 +250,21 @@ export const ProductsModule: React.FC<ProductsModuleProps> = ({ onQuickImportCli
         retail: Number(formData.retailPrice),
         wholesale: Number(formData.wholesalePrice),
         dealer: Number(formData.agencyPrice),
+        agency: Number(formData.agencyPrice),
       },
       stock: Number(formData.stock),
       inquiryOnly: formData.isInquiryOnly,
+      isInquiryOnly: formData.isInquiryOnly,
       unit: formData.unit,
       description: formData.description,
       tags: tagsArray,
       images: [formData.imageUrl],
+      image: formData.imageUrl,
+      catalogPage: Number(formData.catalogPage) || undefined,
+      catalogItemNumber: Number(formData.catalogItemNumber) || undefined,
+      matchedCatalogCode: formData.matchedCatalogCode || formData.code,
+      verificationStatus: formData.verificationStatus,
+      matchConfidence: Number(formData.matchConfidence) || 95,
       technicalSpecs: specsArray,
     };
 
@@ -253,6 +304,15 @@ export const ProductsModule: React.FC<ProductsModuleProps> = ({ onQuickImportCli
         </div>
 
         <div className="flex items-center gap-2">
+          <button
+            onClick={handleResetCatalog}
+            title="همگام‌سازی تمام ۸۶۴ کالا با کاتالوگ تصویری و متنی"
+            className="py-2.5 px-3.5 rounded-xl bg-slate-100 hover:bg-slate-200 text-slate-700 font-bold text-xs transition-colors flex items-center gap-1.5 cursor-pointer"
+          >
+            <RefreshCw className="w-3.5 h-3.5 text-blue-600" />
+            <span>همگام‌سازی کاتالوگ رسمی (۸۶۴ کالا)</span>
+          </button>
+
           {onQuickImportClick && (
             <button
               onClick={onQuickImportClick}
@@ -315,6 +375,99 @@ export const ProductsModule: React.FC<ProductsModuleProps> = ({ onQuickImportCli
       {/* --- TAB 1: PRODUCTS TABLE --- */}
       {activeSubTab === 'products' && (
         <div className="space-y-4">
+          {/* Verification Status Quick Filter Pills */}
+          <div className="bg-white p-3 rounded-2xl border border-slate-200 flex flex-wrap items-center justify-between gap-2">
+            <div className="flex flex-wrap items-center gap-2 text-xs">
+              <span className="font-bold text-slate-500 text-[11px] ml-1">تطبیق و راستی‌آزمایی کاتالوگ:</span>
+              <button
+                onClick={() => {
+                  setVerificationFilter('all');
+                  setCurrentPage(1);
+                }}
+                className={`px-3 py-1.5 rounded-xl font-bold text-xs transition-colors cursor-pointer ${
+                  verificationFilter === 'all'
+                    ? 'bg-[#0A172F] text-white shadow-xs'
+                    : 'bg-slate-100 text-slate-700 hover:bg-slate-200'
+                }`}
+              >
+                همه ({toPersianDigits(products.length)})
+              </button>
+              <button
+                onClick={() => {
+                  setVerificationFilter('catalog_verified');
+                  setCurrentPage(1);
+                }}
+                className={`px-3 py-1.5 rounded-xl font-bold text-xs transition-colors cursor-pointer flex items-center gap-1.5 ${
+                  verificationFilter === 'catalog_verified'
+                    ? 'bg-emerald-600 text-white shadow-xs'
+                    : 'bg-emerald-50 text-emerald-800 hover:bg-emerald-100'
+                }`}
+              >
+                <CheckCircle className="w-3.5 h-3.5" />
+                <span>تأیید کاتالوگی ({toPersianDigits(products.filter(p => p.verificationStatus === 'catalog_verified').length)})</span>
+              </button>
+              <button
+                onClick={() => {
+                  setVerificationFilter('visual_matched');
+                  setCurrentPage(1);
+                }}
+                className={`px-3 py-1.5 rounded-xl font-bold text-xs transition-colors cursor-pointer flex items-center gap-1.5 ${
+                  verificationFilter === 'visual_matched'
+                    ? 'bg-blue-600 text-white shadow-xs'
+                    : 'bg-blue-50 text-blue-800 hover:bg-blue-100'
+                }`}
+              >
+                <Eye className="w-3.5 h-3.5" />
+                <span>تطبیق تصویری ({toPersianDigits(products.filter(p => p.verificationStatus === 'visual_matched').length)})</span>
+              </button>
+              <button
+                onClick={() => {
+                  setVerificationFilter('semantic_ai');
+                  setCurrentPage(1);
+                }}
+                className={`px-3 py-1.5 rounded-xl font-bold text-xs transition-colors cursor-pointer flex items-center gap-1.5 ${
+                  verificationFilter === 'semantic_ai'
+                    ? 'bg-purple-600 text-white shadow-xs'
+                    : 'bg-purple-50 text-purple-800 hover:bg-purple-100'
+                }`}
+              >
+                <Sparkles className="w-3.5 h-3.5" />
+                <span>هوش مصنوعی ({toPersianDigits(products.filter(p => p.verificationStatus === 'semantic_ai').length)})</span>
+              </button>
+              <button
+                onClick={() => {
+                  setVerificationFilter('needs_review');
+                  setCurrentPage(1);
+                }}
+                className={`px-3 py-1.5 rounded-xl font-bold text-xs transition-colors cursor-pointer flex items-center gap-1.5 ${
+                  verificationFilter === 'needs_review'
+                    ? 'bg-amber-600 text-white shadow-xs'
+                    : 'bg-amber-50 text-amber-800 hover:bg-amber-100'
+                }`}
+              >
+                <AlertCircle className="w-3.5 h-3.5" />
+                <span>نیازمند بازبینی ({toPersianDigits(products.filter(p => p.verificationStatus === 'needs_review').length)})</span>
+              </button>
+            </div>
+
+            <div className="flex items-center gap-2 text-xs text-slate-500">
+              <span>تعداد در صفحه:</span>
+              <select
+                value={itemsPerPage}
+                onChange={e => {
+                  setItemsPerPage(Number(e.target.value));
+                  setCurrentPage(1);
+                }}
+                className="h-8 px-2 rounded-lg border border-slate-200 bg-white font-mono text-xs"
+              >
+                <option value={12}>۱۲</option>
+                <option value={24}>۲۴</option>
+                <option value={48}>۴۸</option>
+                <option value={96}>۹۶</option>
+              </select>
+            </div>
+          </div>
+
           {/* Filters Bar */}
           <div className="bg-white p-4 rounded-2xl border border-slate-200 shadow-xs grid grid-cols-1 md:grid-cols-4 gap-3">
             {/* Search */}
@@ -326,7 +479,7 @@ export const ProductsModule: React.FC<ProductsModuleProps> = ({ onQuickImportCli
                   setSearchQuery(e.target.value);
                   setCurrentPage(1);
                 }}
-                placeholder="جستجو با نام کالا، کد یا برند..."
+                placeholder="جستجو با کد کالا، نام، کد کاتالوگ یا برند..."
                 className="w-full h-10 pr-9 pl-3 rounded-xl border border-slate-200 text-xs text-[#0A172F] focus:outline-none focus:border-[#F97316]"
               />
               <Search className="w-4 h-4 text-slate-400 absolute right-3 top-1/2 -translate-y-1/2" />
@@ -342,7 +495,7 @@ export const ProductsModule: React.FC<ProductsModuleProps> = ({ onQuickImportCli
                 }}
                 className="w-full h-10 px-3 rounded-xl border border-slate-200 text-xs text-[#0A172F] bg-white focus:outline-none focus:border-[#F97316]"
               >
-                <option value="all">همه دسته‌بندی‌ها</option>
+                <option value="all">همه دسته‌بندی‌ها (۱۳ دسته)</option>
                 {categories.map(c => (
                   <option key={c.slug} value={c.slug}>
                     {c.name}
@@ -394,111 +547,130 @@ export const ProductsModule: React.FC<ProductsModuleProps> = ({ onQuickImportCli
               <table className="w-full text-right text-xs">
                 <thead>
                   <tr className="bg-slate-50 border-b border-slate-200 text-[#0A172F] font-bold">
-                    <th className="py-3 px-4">کد کالا</th>
-                    <th className="py-3 px-4">مشخصات و تصویر</th>
-                    <th className="py-3 px-4">دسته / برند</th>
-                    <th className="py-3 px-4">قیمت مصرف‌کننده</th>
-                    <th className="py-3 px-4">قیمت پخش / همکار</th>
-                    <th className="py-3 px-4">قیمت عاملیت</th>
-                    <th className="py-3 px-4">موجودی</th>
-                    <th className="py-3 px-4">وضعیت</th>
-                    <th className="py-3 px-4 text-center">عملیات</th>
+                    <th className="py-3 px-3">کد و وضعیت</th>
+                    <th className="py-3 px-3">تصویر واقعی و مشخصات</th>
+                    <th className="py-3 px-3">دسته‌بندی و زیرگروه</th>
+                    <th className="py-3 px-3">انطباق کاتالوگ</th>
+                    <th className="py-3 px-3">سطح اطمینان</th>
+                    <th className="py-3 px-3">قیمت مصرف‌کننده</th>
+                    <th className="py-3 px-3">موجودی</th>
+                    <th className="py-3 px-3 text-center">عملیات</th>
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-slate-100">
                   {paginatedProducts.length === 0 ? (
                     <tr>
-                      <td colSpan={9} className="py-8 text-center text-slate-400">
+                      <td colSpan={8} className="py-8 text-center text-slate-400">
                         هیچ کالایی با فیلترهای انتخابی یافت نشد.
                       </td>
                     </tr>
                   ) : (
-                    paginatedProducts.map(p => (
-                      <tr key={p.code} className="hover:bg-slate-50/70 transition-colors">
-                        <td className="py-3 px-4 font-mono font-bold text-[#0A172F]">
-                          {p.code}
-                        </td>
-                        <td className="py-3 px-4">
-                          <div className="flex items-center gap-3">
-                            <img
-                              src={p.image || 'https://images.unsplash.com/photo-1581092160607-ee22621dd758?w=200&q=80'}
-                              alt={p.name}
-                              className="w-10 h-10 rounded-lg object-cover border border-slate-200 shrink-0"
-                            />
-                            <div>
-                              <div className="font-bold text-[#0A172F] line-clamp-1">{p.name}</div>
-                              <div className="text-[10px] text-slate-400 font-mono mt-0.5">واحد: {p.unit || 'عدد'}</div>
+                    paginatedProducts.map(p => {
+                      const statusColor =
+                        p.verificationStatus === 'catalog_verified'
+                          ? 'bg-emerald-50 text-emerald-700 border-emerald-200'
+                          : p.verificationStatus === 'visual_matched'
+                          ? 'bg-blue-50 text-blue-700 border-blue-200'
+                          : p.verificationStatus === 'semantic_ai'
+                          ? 'bg-purple-50 text-purple-700 border-purple-200'
+                          : 'bg-amber-50 text-amber-700 border-amber-200';
+
+                      const statusLabel =
+                        p.verificationStatus === 'catalog_verified'
+                          ? 'تأیید کاتالوگی'
+                          : p.verificationStatus === 'visual_matched'
+                          ? 'تطبیق تصویری'
+                          : p.verificationStatus === 'semantic_ai'
+                          ? 'هوش مصنوعی'
+                          : 'نیازمند بازبینی';
+
+                      return (
+                        <tr key={p.code} className="hover:bg-slate-50/70 transition-colors">
+                          <td className="py-3 px-3">
+                            <div className="font-mono font-bold text-[#0A172F]">{p.code}</div>
+                            {p.matchedCatalogCode && p.matchedCatalogCode !== p.code && (
+                              <div className="text-[10px] text-slate-400 font-mono">کد: {p.matchedCatalogCode}</div>
+                            )}
+                          </td>
+                          <td className="py-3 px-3">
+                            <div className="flex items-center gap-2.5">
+                              <img
+                                src={p.image || (p.images && p.images[0]) || ''}
+                                alt={p.name}
+                                className="w-11 h-11 rounded-xl object-cover border border-slate-200 shrink-0 bg-slate-50"
+                              />
+                              <div className="min-w-0 max-w-xs">
+                                <div className="font-bold text-[#0A172F] truncate">{p.name}</div>
+                                <div className="text-[10px] text-slate-400 font-mono mt-0.5">
+                                  برند: {p.brand} | واحد: {p.unit || 'عدد'}
+                                </div>
+                              </div>
                             </div>
-                          </div>
-                        </td>
-                        <td className="py-3 px-4">
-                          <div className="font-medium text-slate-700">{p.brand}</div>
-                          <div className="text-[10px] text-slate-400 line-clamp-1">{p.subcategory || p.category}</div>
-                        </td>
-                        <td className="py-3 px-4 font-mono font-bold text-[#EA580C]">
-                          {p.isInquiryOnly ? (
-                            <span className="text-amber-600 bg-amber-50 px-2 py-0.5 rounded text-[11px]">استعلامی</span>
-                          ) : (
-                            `${formatPrice(p.prices.retail)} ت`
-                          )}
-                        </td>
-                        <td className="py-3 px-4 font-mono font-bold text-[#0A172F]">
-                          {p.isInquiryOnly ? '-' : `${formatPrice(p.prices.wholesale)} ت`}
-                        </td>
-                        <td className="py-3 px-4 font-mono font-bold text-emerald-700">
-                          {p.isInquiryOnly ? '-' : `${formatPrice(p.prices.agency)} ت`}
-                        </td>
-                        <td className="py-3 px-4 font-mono">
-                          <span
-                            className={`font-bold ${
-                              p.stock > 10 ? 'text-emerald-600' : p.stock > 0 ? 'text-amber-600' : 'text-red-500'
-                            }`}
-                          >
-                            {toPersianDigits(p.stock)}
-                          </span>
-                        </td>
-                        <td className="py-3 px-4">
-                          {p.isInquiryOnly ? (
-                            <span className="px-2 py-0.5 rounded-full text-[10px] font-bold bg-purple-50 text-purple-700 border border-purple-200">
-                              فقط استعلام
+                          </td>
+                          <td className="py-3 px-3">
+                            <div className="font-medium text-slate-700">{p.categoryName || p.category}</div>
+                            <div className="text-[10px] text-slate-400 truncate">{p.subcategory || '-'}</div>
+                          </td>
+                          <td className="py-3 px-3">
+                            {p.catalogPage ? (
+                              <span className="inline-flex items-center gap-1 font-mono text-[11px] bg-slate-100 text-slate-700 px-2 py-0.5 rounded-md">
+                                <span>ص. {toPersianDigits(p.catalogPage)}</span>
+                                {p.catalogItemNumber && <span>- #{toPersianDigits(p.catalogItemNumber)}</span>}
+                              </span>
+                            ) : (
+                              <span className="text-slate-400 text-[10px]">مشخص نشده</span>
+                            )}
+                          </td>
+                          <td className="py-3 px-3">
+                            <span className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-bold border ${statusColor}`}>
+                              <span>{statusLabel}</span>
+                              <span className="font-mono">({toPersianDigits(p.matchConfidence || 90)}٪)</span>
                             </span>
-                          ) : p.stock > 0 ? (
-                            <span className="px-2 py-0.5 rounded-full text-[10px] font-bold bg-emerald-50 text-emerald-700 border border-emerald-200">
-                              فعال در انبار
+                          </td>
+                          <td className="py-3 px-3 font-mono font-bold text-[#EA580C]">
+                            {p.isInquiryOnly || p.inquiryOnly ? (
+                              <span className="text-amber-600 bg-amber-50 px-2 py-0.5 rounded text-[11px]">استعلامی</span>
+                            ) : (
+                              `${formatPrice(p.prices.retail)} ت`
+                            )}
+                          </td>
+                          <td className="py-3 px-3 font-mono">
+                            <span
+                              className={`font-bold ${
+                                p.stock > 10 ? 'text-emerald-600' : p.stock > 0 ? 'text-amber-600' : 'text-red-500'
+                              }`}
+                            >
+                              {toPersianDigits(p.stock)}
                             </span>
-                          ) : (
-                            <span className="px-2 py-0.5 rounded-full text-[10px] font-bold bg-red-50 text-red-700 border border-red-200">
-                              ناموجود
-                            </span>
-                          )}
-                        </td>
-                        <td className="py-3 px-4 text-center">
-                          <div className="flex items-center justify-center gap-1.5">
-                            <button
-                              onClick={() => handleOpenEdit(p)}
-                              title="ویرایش کالا"
-                              className="p-1.5 rounded-lg text-blue-600 hover:bg-blue-50 transition-colors cursor-pointer"
-                            >
-                              <Edit2 className="w-4 h-4" />
-                            </button>
-                            <button
-                              onClick={() => handleToggleActive(p)}
-                              title={p.stock > 0 ? 'غیرفعال‌سازی (اتمام موجودی)' : 'فعال‌سازی موجودی'}
-                              className="p-1.5 rounded-lg text-slate-500 hover:bg-slate-100 transition-colors cursor-pointer"
-                            >
-                              <RefreshCw className="w-4 h-4" />
-                            </button>
-                            <button
-                              onClick={() => handleDeleteProduct(p.code)}
-                              title="حذف کالا"
-                              className="p-1.5 rounded-lg text-red-500 hover:bg-red-50 transition-colors cursor-pointer"
-                            >
-                              <Trash2 className="w-4 h-4" />
-                            </button>
-                          </div>
-                        </td>
-                      </tr>
-                    ))
+                          </td>
+                          <td className="py-3 px-3 text-center">
+                            <div className="flex items-center justify-center gap-1">
+                              <button
+                                onClick={() => handleOpenEdit(p)}
+                                title="ویرایش کالا"
+                                className="p-1.5 rounded-lg text-blue-600 hover:bg-blue-50 transition-colors cursor-pointer"
+                              >
+                                <Edit2 className="w-4 h-4" />
+                              </button>
+                              <button
+                                onClick={() => handleToggleActive(p)}
+                                title={p.stock > 0 ? 'غیرفعال‌سازی (اتمام موجودی)' : 'فعال‌سازی موجودی'}
+                                className="p-1.5 rounded-lg text-slate-500 hover:bg-slate-100 transition-colors cursor-pointer"
+                              >
+                                <RefreshCw className="w-4 h-4" />
+                              </button>
+                              <button
+                                onClick={() => handleDeleteProduct(p.code)}
+                                title="حذف کالا"
+                                className="p-1.5 rounded-lg text-red-500 hover:bg-red-50 transition-colors cursor-pointer"
+                              >
+                                <Trash2 className="w-4 h-4" />
+                              </button>
+                            </div>
+                          </td>
+                        </tr>
+                      );
+                    })
                   )}
                 </tbody>
               </table>
@@ -937,20 +1109,94 @@ export const ProductsModule: React.FC<ProductsModuleProps> = ({ onQuickImportCli
 
               {/* Row 6: Image URL and Gallery */}
               <div className="space-y-2 border-t border-slate-100 pt-4">
-                <label className="text-xs font-bold text-[#0A172F] block">آدرس تصویر یا آپلود گالری صنعتی</label>
+                <label className="text-xs font-bold text-[#0A172F] block">آدرس تصویر یا نام فایل محصول</label>
                 <div className="flex items-center gap-3">
                   <img
                     src={formData.imageUrl}
                     alt="Preview"
-                    className="w-14 h-14 rounded-xl object-cover border border-slate-200 shrink-0"
+                    className="w-14 h-14 rounded-xl object-cover border border-slate-200 shrink-0 bg-slate-50"
                   />
                   <input
-                    type="url"
+                    type="text"
                     value={formData.imageUrl}
                     onChange={e => setFormData({ ...formData, imageUrl: e.target.value })}
-                    placeholder="https://..."
+                    placeholder="https://... یا نام فایل تصویر"
                     className="flex-1 h-10 px-3 rounded-xl border border-slate-200 text-xs font-mono outline-none"
                   />
+                </div>
+              </div>
+
+              {/* Row 6.5: Catalog Verification & Visual Match Info */}
+              <div className="p-4 rounded-2xl bg-blue-50/60 border border-blue-200/80 space-y-3">
+                <div className="flex items-center justify-between">
+                  <div className="flex items-center gap-2">
+                    <CheckCircle className="w-4 h-4 text-blue-600" />
+                    <span className="font-black text-xs text-[#0A172F]">اطلاعات اعتبارسنجی و انطباق با کاتالوگ PDF</span>
+                  </div>
+                  <span className="text-[10px] text-blue-700 bg-blue-100 px-2 py-0.5 rounded-full font-bold">
+                    تطبیق هوشمند تصویری و متنی
+                  </span>
+                </div>
+
+                <div className="grid grid-cols-1 sm:grid-cols-5 gap-3 text-xs">
+                  <div>
+                    <label className="font-bold text-slate-700 block mb-1">صفحه کاتالوگ</label>
+                    <input
+                      type="number"
+                      value={formData.catalogPage || ''}
+                      onChange={e => setFormData({ ...formData, catalogPage: Number(e.target.value) })}
+                      placeholder="مثلاً ۳"
+                      className="w-full h-10 px-3 rounded-xl border border-slate-200 bg-white font-mono text-center outline-none"
+                    />
+                  </div>
+
+                  <div>
+                    <label className="font-bold text-slate-700 block mb-1">ردیف در صفحه</label>
+                    <input
+                      type="number"
+                      value={formData.catalogItemNumber || ''}
+                      onChange={e => setFormData({ ...formData, catalogItemNumber: Number(e.target.value) })}
+                      placeholder="مثلاً ۵"
+                      className="w-full h-10 px-3 rounded-xl border border-slate-200 bg-white font-mono text-center outline-none"
+                    />
+                  </div>
+
+                  <div>
+                    <label className="font-bold text-slate-700 block mb-1">کد تطبیق کاتالوگ</label>
+                    <input
+                      type="text"
+                      value={formData.matchedCatalogCode || ''}
+                      onChange={e => setFormData({ ...formData, matchedCatalogCode: e.target.value })}
+                      placeholder="مثلاً 3V-500"
+                      className="w-full h-10 px-3 rounded-xl border border-slate-200 bg-white font-mono text-center outline-none"
+                    />
+                  </div>
+
+                  <div>
+                    <label className="font-bold text-slate-700 block mb-1">وضعیت اعتبارسنجی</label>
+                    <select
+                      value={formData.verificationStatus}
+                      onChange={e => setFormData({ ...formData, verificationStatus: e.target.value as any })}
+                      className="w-full h-10 px-2 rounded-xl border border-slate-200 bg-white text-xs outline-none"
+                    >
+                      <option value="catalog_verified">تأیید کاتالوگی (رسمی)</option>
+                      <option value="visual_matched">تطبیق تصویری</option>
+                      <option value="semantic_ai">هوش مصنوعی و سمانتیک</option>
+                      <option value="needs_review">نیازمند بازبینی</option>
+                    </select>
+                  </div>
+
+                  <div>
+                    <label className="font-bold text-slate-700 block mb-1">درصد اطمینان (٪)</label>
+                    <input
+                      type="number"
+                      min={0}
+                      max={100}
+                      value={formData.matchConfidence || 95}
+                      onChange={e => setFormData({ ...formData, matchConfidence: Number(e.target.value) })}
+                      className="w-full h-10 px-3 rounded-xl border border-slate-200 bg-white font-mono text-center outline-none"
+                    />
+                  </div>
                 </div>
               </div>
 
