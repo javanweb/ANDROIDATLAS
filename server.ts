@@ -1423,6 +1423,11 @@ async function montageBrowseCatalog(
   for (const { ref, kind } of pickedRefs) {
     const item = catalogItemByCodeRef(ref.code);
     if (!item) continue;
+    // carry the deep-embedding similarity so downstream quality gates and
+    // scoring treat montage picks exactly like any other candidate
+    const embRef = (visualRes.rankedEmb || []).find(
+      r => String(r.code || '').trim().toLowerCase() === item.code.trim().toLowerCase()
+    );
     candidates.push({
       code: item.code,
       name: item.name,
@@ -1443,6 +1448,7 @@ async function montageBrowseCatalog(
       stock: item.stock,
       isVisualMatch: true,
       visualDistance: 999,
+      embSim: embRef ? Number((1 - embRef.distance).toFixed(4)) : undefined,
       montagePicked: true,
     });
   }
@@ -1545,6 +1551,28 @@ async function verifyCandidatesVisually(
             ? `${v.visualExplanation} (راستی‌آزمایی تکمیلی، قطعیت انطباق را تأیید نکرد — به‌عنوان مشابه دسته‌بندی شد)`
             : 'راستی‌آزمایی تکمیلی، قطعیت انطباق را تأیید نکرد — به‌عنوان مشابه دسته‌بندی شد';
         }
+      }
+    }
+
+    // Deep-embedding evidence override: lightweight fallback models
+    // occasionally reject the TRUE match ("different") because of background,
+    // watermark or lighting differences between the customer photo and the
+    // catalog shot. When the deep visual engine is extremely confident
+    // (cosine >= 0.95), the rejection is overridden to "very_similar" so the
+    // item stays visible as a similar card (and can still be promoted to
+    // exact by the arbitration below). Vision-model confirmation remains the
+    // only path to an exact_match verdict.
+    for (const v of verdicts) {
+      if (v.verdict !== 'different') continue;
+      const p = prepared.find(x => x.cand.code === v.candidateCode);
+      const embSim = p?.cand?.embSim;
+      if (typeof embSim === 'number' && embSim >= 0.95) {
+        console.log(
+          `[Visual Verification] Embedding evidence override: ${v.candidateCode} rejected as "different" but deep-visual similarity is ${embSim.toFixed(3)} -> kept as very_similar`
+        );
+        v.verdict = 'very_similar';
+        v.matchScore = Math.min(92, Math.round(embSim * 100));
+        v.visualExplanation = `موتور بینایی عمیق شباهت ظاهری بسیار بالا (${Math.round(embSim * 100)}٪) برای این کالا ثبت کرده است`;
       }
     }
 
@@ -1984,17 +2012,26 @@ ${stageInstruction}
         if (p.visualVerdict !== 'very_similar') return false;
         // Verified by the online vision model -> trusted similar item.
         if (!p.unverified) return true;
-        // AI picked it while browsing the catalog montage -> trusted lead.
-        if (p.montagePicked) return true;
-        // Otherwise require a confident deep-embedding similarity so we never
-        // show unrelated products as "similar" (e.g. non-industrial photos).
+        // Unverified (AI offline or call failed): require a confident
+        // deep-embedding similarity so we never show unrelated products as
+        // "similar" — montage picks are no exception; a weak model browsing
+        // the grid can pick wrong cells, the embedding gate catches that.
         return typeof p.embSim === 'number' && p.embSim >= 0.9;
       })
       .sort((a, b) => (b.similarityScore || 0) - (a.similarityScore || 0))
       .slice(0, 4);
 
-    // Sort exact matches by score descending
-    exactMatches.sort((a, b) => (b.similarityScore || 0) - (a.similarityScore || 0));
+    // Sort exact matches: deep-embedding similarity dominates the ordering
+    // (weighted blend, model score as a small tiebreaker). Weak verification
+    // models produce noisy scores (e.g. 98 vs 95); the embedding-nearest item
+    // is almost always the true match, so it must be shown first.
+    exactMatches.sort((a, b) => {
+      const orderKey = (p: any) =>
+        typeof p.embSim === 'number'
+          ? p.embSim * 100 + (p.similarityScore || 0) * 0.25
+          : (p.similarityScore || 0);
+      return orderKey(b) - orderKey(a);
+    });
 
     let finalMatches: typeof allProcessed;
     let catalogAvailability: any;
