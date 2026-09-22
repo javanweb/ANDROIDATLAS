@@ -31,8 +31,6 @@ import {
   Clock,
 } from 'lucide-react';
 import { STORE_ASSETS } from '../assets/images';
-import { CATEGORIES } from '../data/categories';
-import { toPersianDigits } from '../utils/formatters';
 import { AiVisualPartSearchModal } from '../components/search/AiVisualPartSearchModal';
 import { AiConsultModal } from '../components/search/AiConsultModal';
 import { OurClientsSection } from '../components/home/OurClientsSection';
@@ -237,14 +235,57 @@ export const HomePage: React.FC = () => {
     }
   };
 
-  // 13 Official Categories matching production line catalog
-  const categories = CATEGORIES.map(cat => ({
-    id: cat.id,
-    title: cat.name,
-    image: cat.image || STORE_ASSETS.categories.transmission,
-    link: `/category/${cat.slug}`,
-    count: cat.count,
-  }));
+  // 8 Categories matching production line catalog
+  const categories = [
+    {
+      id: 1,
+      title: 'قطعات و سیستم‌های انتقال قدرت',
+      image: STORE_ASSETS.categories.transmission,
+      link: '/category/power-transmission',
+    },
+    {
+      id: 2,
+      title: 'تسمه‌های خط تولید و کانوایر',
+      image: STORE_ASSETS.categories.belts,
+      link: '/category/industrial-belts',
+    },
+    {
+      id: 3,
+      title: 'کاشی، سرامیک و رولرهای کوره',
+      image: STORE_ASSETS.products.ceramicParts,
+      link: '/category/ceramic-tiles',
+    },
+    {
+      id: 4,
+      title: 'پولی، فلکه و بوش قفل‌کننده',
+      image: STORE_ASSETS.categories.pulleys,
+      link: '/category/pulleys-idlers',
+    },
+    {
+      id: 5,
+      title: 'بلبرینگ، رولبرینگ و یاتاقان',
+      image: STORE_ASSETS.categories.bearings,
+      link: '/category/bearings-bushings',
+    },
+    {
+      id: 6,
+      title: 'زنجیر و چرخ زنجیر خطوط انتقال',
+      image: STORE_ASSETS.categories.chains,
+      link: '/category/chains-sprockets',
+    },
+    {
+      id: 7,
+      title: 'تجهیزات و تسمه‌های نساجی',
+      image: STORE_ASSETS.categories.conveyor,
+      link: '/category/textile-machinery',
+    },
+    {
+      id: 8,
+      title: 'محصولات انحصاری SWR و FORZA',
+      image: STORE_ASSETS.heroPulley,
+      link: '/category/swr-forza-exclusive',
+    },
+  ];
 
   // 7 Covered Industries matching reference screenshot exactly
   const coveredIndustries = [
@@ -752,31 +793,28 @@ export const HomePage: React.FC = () => {
             </Link>
           </div>
 
-          {/* 13 Official Categories Grid */}
-          <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-7 gap-3">
+          {/* 8 Clean Cards Grid */}
+          <div className="grid grid-cols-2 sm:grid-cols-4 lg:grid-cols-8 gap-3">
             {categories.map(cat => (
               <Link
                 key={cat.id}
                 to={cat.link}
                 className="group bg-white rounded-2xl border border-slate-200/80 p-3 flex flex-col justify-between hover:border-[#F97316] hover:shadow-[0_8px_25px_rgba(249,115,22,0.2)] hover:ring-2 hover:ring-orange-500/20 hover:-translate-y-1 transition-all duration-300 text-right"
               >
-                {/* Product Image Box with Count Badge */}
-                <div className="relative w-full aspect-square rounded-xl overflow-hidden bg-slate-50 border border-slate-100 flex items-center justify-center mb-2.5 group-hover:bg-orange-50/40 group-hover:border-orange-200/60 transition-colors">
+                {/* Product Image Box */}
+                <div className="w-full aspect-square rounded-xl overflow-hidden bg-slate-50 border border-slate-100 flex items-center justify-center mb-3 group-hover:bg-orange-50/40 group-hover:border-orange-200/60 transition-colors">
                   <img
                     src={cat.image}
                     alt={cat.title}
                     loading="lazy"
                     className="w-full h-full object-cover group-hover:scale-105 transition-transform duration-300"
                   />
-                  <div className="absolute top-1.5 left-1.5 bg-[#0A172F]/80 backdrop-blur-xs text-white text-[9px] px-1.5 py-0.5 rounded-full font-mono">
-                    {toPersianDigits(cat.count || 0)}
-                  </div>
                 </div>
 
                 {/* Title & Orange Arrow Circle Button */}
                 <div className="flex items-center justify-between gap-1.5 pt-1">
-                  <div className="w-6 h-6 rounded-full bg-[#F97316] group-hover:bg-[#EA580C] text-white flex items-center justify-center shrink-0 shadow-xs group-hover:shadow-[0_0_8px_#F97316] transition-all">
-                    <ArrowLeft className="w-3 h-3 group-hover:-translate-x-0.5 transition-transform" />
+                  <div className="w-7 h-7 rounded-full bg-[#F97316] group-hover:bg-[#EA580C] text-white flex items-center justify-center shrink-0 shadow-xs group-hover:shadow-[0_0_8px_#F97316] transition-all">
+                    <ArrowLeft className="w-3.5 h-3.5 group-hover:-translate-x-0.5 transition-transform" />
                   </div>
                   <h3 className="font-bold text-xs text-[#0A172F] group-hover:text-[#F97316] transition-colors line-clamp-1">
                     {cat.title}

@@ -501,33 +501,17 @@ export const adminService = {
   getProducts(): Product[] {
     try {
       const stored = localStorage.getItem(STORAGE_KEYS.ADMIN_PRODUCTS);
-      if (stored) {
-        const parsed = JSON.parse(stored);
-        if (Array.isArray(parsed) && parsed.length >= 500) {
-          return parsed;
-        }
-      }
+      if (stored) return JSON.parse(stored);
     } catch {
       // ignore
     }
-    const initial = generateMockProducts();
+    const initial = generateMockProducts().slice(0, 35);
     try {
       localStorage.setItem(STORAGE_KEYS.ADMIN_PRODUCTS, JSON.stringify(initial));
     } catch {
       // ignore
     }
     return initial;
-  },
-
-  resetToVerifiedCatalog(): Product[] {
-    const fresh = generateMockProducts();
-    try {
-      localStorage.setItem(STORAGE_KEYS.ADMIN_PRODUCTS, JSON.stringify(fresh));
-      this.logAction('بازنشانی به کاتالوگ رسمی', 'کاتالوگ اطلس', 'تمام ۸۶۴ محصول با داده‌های تطبیق‌یافته کاتالوگ بازنشانی شدند.');
-    } catch {
-      // ignore
-    }
-    return fresh;
   },
 
   saveProduct(product: Product): void {
@@ -1103,17 +1087,7 @@ ERR-001,تسمه بدون قیمت تستی,نامشخص,ناشناخته,0,-5`;
   getCategories(): Category[] {
     try {
       const stored = localStorage.getItem(STORAGE_KEYS.CATEGORIES);
-      if (stored) {
-        const parsed = JSON.parse(stored);
-        if (Array.isArray(parsed) && parsed.length >= 13) {
-          return parsed;
-        }
-      }
-    } catch {
-      // ignore
-    }
-    try {
-      localStorage.setItem(STORAGE_KEYS.CATEGORIES, JSON.stringify(CATEGORIES));
+      if (stored) return JSON.parse(stored);
     } catch {
       // ignore
     }

@@ -28,14 +28,12 @@ export interface TechnicalSpec {
   value: string;
 }
 
-export type VerificationStatus = 'verified' | 'needs_review' | 'no_match' | 'duplicate';
-
 export interface Product {
   code: string;               // e.g. "AT-751", "SWR-230", "FORZA-A45"
   name: string;               // نام فارسی محصول
   nameEn?: string;            // نام لاتین
   brand: string;              // SWR, FORZA, Megadyne, Optibelt, etc.
-  categorySlug: string;       // belts-power-transmission, profiles-rails, etc.
+  categorySlug: string;       // industrial-belts, ceramic-tiles, etc.
   categoryName: string;
   subcategory: string;        // V-Belt, Timing, Roller, Filter, etc.
   technicalSpecs: TechnicalSpec[];
@@ -43,32 +41,16 @@ export interface Product {
   discountPercent?: number;   // درصد تخفیف نمایش عمومی (در صورت وجود)
   stock: number;              // موجودی انبار
   inquiryOnly: boolean;       // وضعیت «فقط استعلامی»
-  images: string[];           // Product image URLs from imagesproducts
+  images: string[];           // SVG Data URIs or optimized SVGs
   tags: string[];             // e.g. ["پرفروش", "ویژه کاشی", "ضد سایش"]
   minOrderQty?: number;       // حداقل سفارش پخش/نماینده
   unit: string;               // عدد، متر، شاخه، رول، ست
   featured?: boolean;         // نمایش در پیشنهاد شگفت‌انگیز
   description?: string;       // توضیحات فنی و کاربرد محصول
   clubPointsReward?: number;  // امتیاز باشگاه قابل کسب با خرید این کالا
-  forzaCode?: string;         // کد رسمی کاتالوگ فورزا اطلس مثل "FORZACODE : 1000 0 1"
+  forzaCode?: string;         // کد رسمی کاتالوگ فورزا اطلس مثل "FORZACODE: 1000 0 1"
   cataloguePage?: number;     // شماره صفحه کاتالوگ رسمی ۱۴۰۴ اطلس
   hasCatalogueImage?: boolean;// آیا دارای تصویر مستقیم و ثبت‌شده از کاتالوگ است
-
-  // Visual & Semantic Verification and Matching fields (Sections 4, 8 & 14)
-  productImage?: string;
-  catalogPage?: number;
-  catalogImage?: string;
-  productName?: string;
-  catalogName?: string;
-  productCode?: string;
-  category?: string;
-  matchConfidence?: number;   // 0 - 100 based on visual & semantic proof
-  matchReason?: string;       // علت و شواهد تطبیق بصری
-  verificationStatus?: VerificationStatus;
-  catalogSource?: string;
-  catalogProductIndex?: number;
-  imageMatchStatus?: 'matched' | 'partial' | 'unmatched';
-  codeMatchStatus?: 'exact' | 'referenced' | 'unspecified';
 }
 
 export interface Category {
