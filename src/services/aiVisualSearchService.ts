@@ -38,13 +38,6 @@ export interface CatalogAvailability {
   statusFarsiMessage: string;
 }
 
-export interface VisualFeatureComparison {
-  feature: string;
-  userImageObserved: string;
-  catalogMatchObserved: string;
-  match: boolean;
-}
-
 export interface MatchedPartItem {
   code: string;
   name: string;
@@ -63,12 +56,9 @@ export interface MatchedPartItem {
   visualVerdictFarsi?: string; // e.g. "همونه (انطباق قطعی)" | "شبیهه (مدل مشابه/جایگزین)" | "فرق داره"
   visualExplanation?: string;  // Persian side-by-side comparative inspection rationale
   verificationConfidence?: number;
-  visualFeaturesCompared?: VisualFeatureComparison[];
   forzaCode?: string;
   cataloguePage?: number;
   image?: string;
-  price?: number;
-  stock?: number;
 }
 
 export interface AiPartAnalysisResult {
@@ -232,40 +222,5 @@ export const aiVisualSearchService = {
       reader.readAsDataURL(blob);
     });
     return { base64, mimeType: blob.type || 'image/jpeg' };
-  },
-
-  // Conversational chat with the Visual AI Agent regarding the uploaded part & catalog match
-  async sendAgentMessage(params: {
-    message: string;
-    imageBase64?: string;
-    mimeType?: string;
-    matchedProduct?: MatchedPartItem;
-    analysisSummary?: any;
-    conversationHistory?: { role: 'user' | 'agent'; text: string }[];
-  }): Promise<{ reply: string; suggestedFollowUps: string[] }> {
-    let { imageBase64, mimeType } = params;
-    if (imageBase64 && /^https?:\/\//i.test(imageBase64.trim())) {
-      const converted = await this.urlToBase64(imageBase64.trim());
-      imageBase64 = converted.base64;
-      mimeType = converted.mimeType;
-    }
-
-    const response = await fetch('/api/ai/visual-agent/chat', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        ...params,
-        imageBase64,
-        mimeType,
-      }),
-    });
-
-    if (!response.ok) {
-      throw new Error(`خطا در ارتباط با ایژنت هوش مصنوعی: کد ${response.status}`);
-    }
-
-    return await response.json();
   },
 };

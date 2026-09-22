@@ -918,39 +918,6 @@ async function verifyCandidatesVisually(
   return null;
 }
 
-// Generate structured side-by-side visual attribute comparisons between user photo and catalog match
-function generateFeatureComparisons(item: any, parsed: any, isExact: boolean) {
-  const itemSpecsStr = (item.specs || []).map((s: any) => `${s.key}: ${s.value}`).join(' ');
-  return [
-    {
-      feature: 'هندسه و فرم فیزیکی بدنه',
-      userImageObserved: parsed?.whatYouSee || parsed?.detectedPartType || 'فرم قطعه صنعتی در تصویر ارسالی',
-      catalogMatchObserved: `${item.name} (${item.subcategory || item.categoryName || 'کاتالوگ رسمی'})`,
-      match: true,
-    },
-    {
-      feature: 'دندانه‌ها، شیارها یا محل درگیری',
-      userImageObserved: parsed?.detectedProfile || 'پروفیل صنعتی مطابق با ساختار تصویر',
-      catalogMatchObserved: item.forzaCode ? `کد استاندارد کاتالوگ: ${item.forzaCode}` : 'پروفیل صنعتی استاندارد DIN',
-      match: true,
-    },
-    {
-      feature: 'متریال و رنگ ظاهری',
-      userImageObserved: parsed?.material || 'متریال مقاوم صنعتی',
-      catalogMatchObserved: itemSpecsStr.includes('جنس') ? itemSpecsStr.slice(0, 45) : 'متریال گرید خطوط تولید (مقاوم به سایش و حرارت)',
-      match: true,
-    },
-    {
-      feature: 'تطابق تصویر در کاتالوگ اطلس',
-      userImageObserved: 'عکس ارسالی توسط کاربر',
-      catalogMatchObserved: isExact
-        ? `🎯 انطباق مستقیم با عکس رسمی کاتالوگ (صفحه ${item.cataloguePage || item.page || 1})`
-        : `تصویر مرجع کاتالوگ جامع ۱۴۰۴ (صفحه ${item.cataloguePage || item.page || 1})`,
-      match: true,
-    },
-  ];
-}
-
 // POST: /api/ai/analyze-part
 // stage: 'quick'   = image-only instant identification (step 1)
 //        'refined' = image + dimensions + application (steps 2-3)
@@ -1019,23 +986,15 @@ app.post('/api/ai/analyze-part', async (req, res) => {
         (numLength ? 1 : 0) + (numWidth ? 1 : 0) + (numPitch ? 1 : 0) +
         (application ? 1 : 0) + (features ? 1 : 0);
 
-      const mappedNoKey = noKeyCandidates.map((m, idx) => {
-        const isExact = Boolean(noKeyExact && idx === 0);
-        return {
-          ...m,
-          distinction: idx === 1 ? 'گزینه مکمل با ویژگی فنی ویژه' : 'کالای اصلی با بیشترین تطابق تصویری در کاتالوگ',
-          visualVerdict: isExact ? 'exact_match' : 'very_similar',
-          visualVerdictFarsi: isExact ? 'همونه (انطباق مستقیم قطعی)' : 'شبیهه (مدل مشابه استاندارد)',
-          visualExplanation: isExact
-            ? 'تصویر ارسالی شما عیناً با تصویر این کالا در کاتالوگ هایپر صنعت اطلس مطابقت دارد.'
-            : 'فرم هندسی و ویژگی‌های ظاهری این قطعه در کاتالوگ بیشترین همخوانی را با تصویر ارسالی دارد.',
-          visualFeaturesCompared: generateFeatureComparisons(
-            m,
-            { whatYouSee: m.name, detectedPartType: m.name, detectedProfile: m.forzaCode },
-            isExact
-          ),
-        };
-      });
+      const mappedNoKey = noKeyCandidates.map((m, idx) => ({
+        ...m,
+        distinction: idx === 1 ? 'گزینه مکمل با ویژگی فنی ویژه' : 'کالای اصلی با بیشترین تطابق تصویری در کاتالوگ',
+        visualVerdict: noKeyExact && idx === 0 ? 'exact_match' : 'very_similar',
+        visualVerdictFarsi: noKeyExact && idx === 0 ? 'همونه (انطباق مستقیم قطعی)' : 'شبیهه (مدل مشابه استاندارد)',
+        visualExplanation: noKeyExact && idx === 0
+          ? 'تصویر ارسالی شما عیناً با تصویر این کالا در کاتالوگ هایپر صنعت اطلس مطابقت دارد.'
+          : 'فرم هندسی و ویژگی‌های ظاهری این قطعه در کاتالوگ بیشترین همخوانی را با تصویر ارسالی دارد.',
+      }));
 
       return res.json({
         success: true,
@@ -1276,14 +1235,6 @@ ${stageInstruction}
       allProcessed[0].verificationConfidence = 99;
     }
 
-    allProcessed.forEach(item => {
-      item.visualFeaturesCompared = generateFeatureComparisons(
-        item,
-        parsedResult,
-        item.visualVerdict === 'exact_match'
-      );
-    });
-
     // Separate verified matches ('exact_match' or 'very_similar') from structurally 'different' items
     const approvedMatches = allProcessed.filter(
       p => p.visualVerdict === 'exact_match' || p.visualVerdict === 'very_similar'
@@ -1418,23 +1369,15 @@ ${stageInstruction}
       (numLength ? 1 : 0) + (numWidth ? 1 : 0) + (numPitch ? 1 : 0) +
       (req.body?.application ? 1 : 0) + (req.body?.features ? 1 : 0);
 
-    const mergedFallback = fallbackCandidates.map((m: any, idx: number) => {
-      const isExact = Boolean(catchExact && idx === 0);
-      return {
-        ...m,
-        distinction: idx === 1 ? 'گزینه مکمل با ویژگی عملکردی مشابه' : 'کالای اصلی با بالاترین تطابق ظاهری در کاتالوگ',
-        visualVerdict: isExact ? 'exact_match' : 'very_similar',
-        visualVerdictFarsi: isExact ? 'همونه (انطباق مستقیم قطعی)' : 'شبیهه (مدل مشابه استاندارد)',
-        visualExplanation: isExact
-          ? 'تصویر ارسالی شما عیناً با تصویر این کالا در کاتالوگ مطابقت دارد.'
-          : 'مشخصات بصری و فرم هندسی این قطعه بیشترین تطابق را با تصویر ارسالی دارد.',
-        visualFeaturesCompared: generateFeatureComparisons(
-          m,
-          { whatYouSee: m.name, detectedPartType: m.name, detectedProfile: m.forzaCode },
-          isExact
-        ),
-      };
-    });
+    const mergedFallback = fallbackCandidates.map((m: any, idx: number) => ({
+      ...m,
+      distinction: idx === 1 ? 'گزینه مکمل با ویژگی عملکردی مشابه' : 'کالای اصلی با بالاترین تطابق ظاهری در کاتالوگ',
+      visualVerdict: catchExact && idx === 0 ? 'exact_match' : 'very_similar',
+      visualVerdictFarsi: catchExact && idx === 0 ? 'همونه (انطباق مستقیم قطعی)' : 'شبیهه (مدل مشابه استاندارد)',
+      visualExplanation: catchExact && idx === 0
+        ? 'تصویر ارسالی شما عیناً با تصویر این کالا در کاتالوگ مطابقت دارد.'
+        : 'مشخصات بصری و فرم هندسی این قطعه بیشترین تطابق را با تصویر ارسالی دارد.',
+    }));
 
     return res.json({
       success: true,
@@ -1537,123 +1480,6 @@ app.post('/api/ai/consult', async (req, res) => {
         label: 'مشاهده محصولات',
         link: '/category/industrial-belts',
       },
-    });
-  }
-});
-
-// POST: /api/ai/visual-agent/chat
-// Conversational AI Agent for deep visual part matching and engineering consultation
-app.post('/api/ai/visual-agent/chat', async (req, res) => {
-  try {
-    const {
-      message,
-      imageBase64,
-      mimeType = 'image/jpeg',
-      matchedProduct,
-      analysisSummary,
-      conversationHistory = [],
-    } = req.body;
-    const apiKey = getGeminiKey();
-
-    if (!message || typeof message !== 'string') {
-      return res.status(400).json({ error: 'پیام الزامی است' });
-    }
-
-    if (!apiKey) {
-      return res.json({
-        success: true,
-        reply: `بر اساس تطبیق ظاهری انجام‌شده در کاتالوگ جامع هایپر صنعت اطلس، قطعه انتخابی «${matchedProduct?.name || 'کالای صنعتی'}» (کد رسمی ${matchedProduct?.code || 'استاندارد'} / ${matchedProduct?.forzaCode || ''}) دقیقاً دارای همان ساختار هندسی و مقطع فیزیکی تصویر ارسالی شما است. کلیه قطعات استاندارد SWR و FORZA دارای ضمانت فابریک و آماده ارسال سریع از انبار مرکزی یزد می‌باشند.`,
-        suggestedFollowUps: [
-          'شرایط ارسال فوری به کارخانه و زمان تحویل',
-          'مشخصات فنی و راهنمای رگلاژ صحیح',
-          'استعلام تخفیف خرید تیراژ و سازمانی'
-        ],
-      });
-    }
-
-    const ai = new GoogleGenAI({
-      apiKey,
-      httpOptions: {
-        headers: {
-          'User-Agent': 'aistudio-build',
-        },
-      },
-    });
-
-    const parts: any[] = [];
-
-    // Attach user part image if provided
-    const normalizedImage = await normalizeImageInput(imageBase64, mimeType);
-    if (normalizedImage) {
-      parts.push({
-        inlineData: {
-          mimeType: normalizedImage.mimeType,
-          data: normalizedImage.data,
-        },
-      });
-    }
-
-    const promptText = `
-شما «ایژنت هوشمند مهندسی و بینایی ماشین هایپر صنعت اطلس» هستید (تاسیس ۱۳۶۶ یزد، مرجع تخصصی تامین قطعات، تسمه‌ها، پولی‌ها، یاتاقان‌ها و سیستم‌های انتقال قدرت کارخانجات کاشی و سرامیک، سیمان و صنایع سنگین با برندهای SWR آلمان و FORZA).
-
-اطلاعات قطعه در تحلیل تصویری جاری:
-- آنچه در تصویر دیده شد: ${analysisSummary?.whatYouSee || 'تصویر قطعه ارسالی کاربر'}
-- نوع قطعه شناسایی شده: ${analysisSummary?.detectedPartType || 'قطعه صنعتی'}
-- پروفیل و متریال: ${analysisSummary?.detectedProfile || ''} / ${analysisSummary?.material || ''}
-- کالای منطبق در کاتالوگ اطلس: «${matchedProduct?.name || 'قطعه کاتالوگ'}» (کد ${matchedProduct?.code || ''} - کد فورزا: ${matchedProduct?.forzaCode || ''})
-- وضعیت تطابق ظاهری با کاتالوگ: ${matchedProduct?.visualVerdictFarsi || 'منطبق'} (نمره شباهت: ${matchedProduct?.similarityScore || 95}٪)
-- توضیح تطبیق چشمی: ${matchedProduct?.visualExplanation || ''}
-- مشخصات کاتالوگ: ${JSON.stringify(matchedProduct?.specs || [])}
-- قیمت کاتالوگ: ${matchedProduct?.price ? matchedProduct.price + ' تومان' : 'استعلامی'} - وضعیت موجودی: ${matchedProduct?.stock ? matchedProduct.stock + ' عدد در انبار' : 'موجود'}
-
-تاریخچه کوتاه گفتگو:
-${conversationHistory.slice(-4).map((h: any) => `${h.role === 'user' ? 'کاربر' : 'ایژنت'}: ${h.text}`).join('\n')}
-
-پرسش جدید کاربر:
-"${message}"
-
-دستورالعمل پاسخگویی:
-۱. پاسخ را با لحنی محترمانه، به عنوان یک مهندس ارشد و دلسوز بینایی ماشین و مکانیک صنعتی به زبان فارسی سلیس و دقیق بنویسید.
-۲. صریحاً مشخص کنید که آیا ظاهر و ابعاد قطعه با نمونه کاتالوگ منطبق است و در چه ماشین‌آلات و خطوط تولیدی کاربرد دارد.
-۳. در انتهای پاسخ ۲ الی ۳ پرسش پیشنهادی کوتاه و کاملاً هوشمندانه به عنوان suggestedFollowUps قرار دهید تا کاربر بتواند سریعاً روی آن‌ها کلیک کند.
-
-پاسخ را دقیقاً در قالب ساختار JSON زیر بازگردانید (بدون هیچ کاراکتر اضافی خارج از JSON):
-{
-  "reply": "متن پاسخ مهندسی به زبان فارسی",
-  "suggestedFollowUps": ["پرسش پیشنهادی ۱", "پرسش پیشنهادی ۲"]
-}
-`;
-
-    parts.push({ text: promptText });
-
-    const { text } = await generateWithModelCascade(
-      ai,
-      [{ role: 'user', parts }],
-      { responseMimeType: 'application/json' },
-      'Visual Agent Chat'
-    );
-
-    let parsed: any;
-    try {
-      parsed = JSON.parse(stripJsonFences(text));
-    } catch {
-      parsed = { reply: text, suggestedFollowUps: [] };
-    }
-
-    return res.json({
-      success: true,
-      reply: parsed.reply || text,
-      suggestedFollowUps: parsed.suggestedFollowUps || [],
-    });
-  } catch (err: any) {
-    console.error('[Visual Agent Chat] Error:', err?.message);
-    return res.json({
-      success: true,
-      reply: 'بر اساس بررسی فنی و بصری تصویر، این قطعه با استانداردهای کارخانه‌ای کاتالوگ اطلس مطابقت دارد و با شرایط کاری سنگین خطوط تولید سازگار است. جهت هماهنگی ارسال فوری یا استعلام مشخصات اختصاصی می‌توانید با مهندسین واحد فروش هایپر صنعت اطلس ارتباط برقرار فرمایید.',
-      suggestedFollowUps: [
-        'روش صحیح نصب و جلوگیری از سایش زودهنگام',
-        'نحوه ثبت سفارش با صدور پیش‌فاکتور رسمی'
-      ],
     });
   }
 });

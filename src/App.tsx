@@ -22,7 +22,6 @@ import { ClubPage } from './pages/ClubPage';
 import { AgencyPage } from './pages/AgencyPage';
 import { DealerPortalPage } from './pages/DealerPortalPage';
 import { DemoAgenciesAdminPage } from './pages/DemoAgenciesAdminPage';
-import { VisualAgentPage } from './pages/VisualAgentPage';
 import { AdminLayout } from './admin/AdminLayout';
 
 export default function App() {
@@ -37,10 +36,6 @@ export default function App() {
                 <Routes>
                   {/* 1. Home Page */}
                   <Route path="/" element={<HomePage />} />
-
-                  {/* AI Visual Part Identification Agent */}
-                  <Route path="/visual-agent" element={<VisualAgentPage />} />
-                  <Route path="/ai-agent" element={<Navigate to="/visual-agent" replace />} />
 
                   {/* Products Catalog Page */}
                   <Route path="/products" element={<ProductsPage />} />

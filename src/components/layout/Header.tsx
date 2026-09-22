@@ -31,7 +31,6 @@ import {
   Send,
   MessageCircle,
   Package,
-  Bot,
 } from 'lucide-react';
 import { useAuth } from '../../context/AuthContext';
 import { useCart } from '../../context/CartContext';
@@ -1126,17 +1125,6 @@ export const Header: React.FC = () => {
               <span>دانشنامه</span>
             </Link>
 
-            {/* 8. ایژنت هوشمند قطعات (AI Visual Agent) */}
-            <Link
-              to="/visual-agent"
-              onMouseEnter={() => setActiveDropdown(null)}
-              className="relative flex items-center gap-1.5 py-1.5 px-3 rounded-xl bg-gradient-to-r from-cyan-500/20 via-indigo-500/20 to-cyan-500/20 border border-cyan-400/40 hover:border-cyan-300 text-cyan-300 hover:text-white transition-all cursor-pointer font-bold text-xs shadow-xs"
-            >
-              <Bot className="w-4 h-4 text-cyan-400" />
-              <span>ایژنت تصویری قطعات (AI)</span>
-              <span className="w-1.5 h-1.5 rounded-full bg-cyan-400 animate-ping" />
-            </Link>
-
           </nav>
 
           {/* Left: Hotline Support Badge with Pulse */}
@@ -1257,24 +1245,6 @@ export const Header: React.FC = () => {
 
             {/* Scrollable Navigation Accordions */}
             <div className="flex-1 overflow-y-auto p-3 space-y-2 text-xs divide-y divide-slate-800/60">
-              {/* AI Visual Agent Mobile Banner */}
-              <div className="pb-2">
-                <Link
-                  to="/visual-agent"
-                  onClick={() => setIsMobileMenuOpen(false)}
-                  className="flex items-center justify-between p-3 rounded-xl bg-gradient-to-r from-cyan-600 via-indigo-600 to-indigo-700 text-white font-black shadow-lg shadow-indigo-950/40 border border-cyan-400/40"
-                >
-                  <div className="flex items-center gap-2.5">
-                    <Bot className="w-5 h-5 text-cyan-300" />
-                    <div>
-                      <div className="text-xs font-black">ایژنت هوشمند تصویری قطعات (AI)</div>
-                      <div className="text-[10px] text-cyan-200 font-normal">شناسایی قطعه از روی عکس و تطبیق با کاتالوگ</div>
-                    </div>
-                  </div>
-                  <ChevronLeft className="w-4 h-4 text-cyan-300" />
-                </Link>
-              </div>
-
               {/* Direct Products Catalog Banner */}
               <div className="pb-2">
                 <Link
