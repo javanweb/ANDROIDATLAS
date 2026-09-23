@@ -446,7 +446,7 @@ export const ProductsModule: React.FC<ProductsModuleProps> = ({ onQuickImportCli
                           {p.isInquiryOnly ? '-' : `${formatPrice(p.prices.wholesale)} ت`}
                         </td>
                         <td className="py-3 px-4 font-mono font-bold text-emerald-700">
-                          {p.isInquiryOnly ? '-' : `${formatPrice(p.prices.agency)} ت`}
+                          {p.isInquiryOnly ? '-' : `${formatPrice(p.prices.agency || p.prices.dealer || 0)} ت`}
                         </td>
                         <td className="py-3 px-4 font-mono">
                           <span

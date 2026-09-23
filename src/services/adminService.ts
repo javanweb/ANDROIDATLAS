@@ -103,13 +103,15 @@ export interface AdminUser {
 
 export interface AuditLog {
   id: string;
-  userId: string;
-  userName: string;
-  userRole: string;
+  userId?: string;
+  userName?: string;
+  userRole?: string;
   action: string;
-  entity: string;
+  entity?: string;
+  target?: string;
   details: string;
   timestamp: string;
+  [key: string]: any;
 }
 
 export interface PriceHistoryRecord {
@@ -142,9 +144,13 @@ export interface ImportPreviewRow {
 export interface ImportResultReport {
   totalProcessed: number;
   newCount: number;
+  newCreated?: number;
   updatedCount: number;
+  updated?: number;
   errorCount: number;
+  errorsCount?: number;
   errors: { row: number; code: string; message: string }[];
+  errorDetails?: any[];
   timestamp: string;
 }
 
@@ -216,30 +222,34 @@ export interface CampaignItem {
 }
 
 export interface SystemSettings {
-  paymentGateway: {
+  paymentGateway?: {
     provider: 'mellat' | 'saman' | 'zarinpal';
     merchantId: string;
     terminalId: string;
     sandbox: boolean;
   };
-  smsProvider: {
+  paymentGateways?: any;
+  smsProvider?: {
     provider: 'kavenegar' | 'melipayamak' | 'farapayamak';
     apiKey: string;
     senderNumber: string;
   };
-  shippingMethods: {
+  smsConfig?: any;
+  shippingMethods?: {
     barbari: boolean;
     tipax: boolean;
     expressPost: boolean;
     dedicatedFleet: boolean;
   };
-  currency: 'toman' | 'rial';
-  seo: {
+  shippingMethodsConfig?: any;
+  currency?: 'toman' | 'rial';
+  seo?: {
     metaTitle: string;
     metaDescription: string;
     keywords: string;
     canonicalBase: string;
   };
+  [key: string]: any;
 }
 
 const STORAGE_KEYS = {
@@ -826,12 +836,14 @@ ERR-001,تسمه بدون قیمت تستی,نامشخص,ناشناخته,0,-5`;
     return MOCK_INQUIRIES;
   },
 
-  answerInquiry(inquiryId: string, price: number, validityDays: number = 7): void {
+  answerInquiry(inquiryId: string, price: number, validityDays: number | string = 7): void {
     const inquiries = this.getInquiries();
     const idx = inquiries.findIndex(i => i.id === inquiryId);
     if (idx >= 0) {
       const inq = inquiries[idx];
-      const validUntil = new Date(Date.now() + validityDays * 24 * 60 * 60 * 1000).toLocaleDateString('fa-IR');
+      const validUntil = typeof validityDays === 'string' && !/^\d+$/.test(validityDays.trim())
+        ? validityDays
+        : new Date(Date.now() + (Number(validityDays) || 7) * 24 * 60 * 60 * 1000).toLocaleDateString('fa-IR');
       inquiries[idx] = {
         ...inq,
         status: 'answered',

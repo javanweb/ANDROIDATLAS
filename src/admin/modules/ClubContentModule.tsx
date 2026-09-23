@@ -391,7 +391,7 @@ export const ClubContentModule: React.FC = () => {
 
                 <div className="p-4 pt-2 border-t border-slate-100 flex items-center justify-between">
                   <div className="flex items-center gap-1">
-                    {post.tags.slice(0, 2).map((t, i) => (
+                    {(post.tags || []).slice(0, 2).map((t, i) => (
                       <span key={i} className="text-[10px] bg-slate-100 text-slate-600 px-2 py-0.5 rounded-md">
                         #{t}
                       </span>
@@ -556,7 +556,7 @@ export const ClubContentModule: React.FC = () => {
                 <input
                   type="text"
                   name="postTags"
-                  defaultValue={editingPost?.tags.join(', ') || 'تسمه, صنعتی, راهنما'}
+                  defaultValue={editingPost?.tags?.join(', ') || 'تسمه, صنعتی, راهنما'}
                   className="w-full h-10 px-3 rounded-xl border border-slate-200 outline-none"
                 />
               </div>

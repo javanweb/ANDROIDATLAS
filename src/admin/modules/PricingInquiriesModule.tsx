@@ -381,10 +381,10 @@ export const PricingInquiriesModule: React.FC = () => {
                         {formatPrice(inv.subtotal)} ت
                       </td>
                       <td className="py-3.5 px-4 font-mono font-bold text-amber-700">
-                        {formatPrice(inv.tax)} ت
+                        {formatPrice(inv.tax ?? inv.totalTax ?? 0)} ت
                       </td>
                       <td className="py-3.5 px-4 font-mono font-black text-[#EA580C]">
-                        {formatPrice(inv.total)} تومان
+                        {formatPrice(inv.total ?? inv.grandTotal ?? 0)} تومان
                       </td>
                       <td className="py-3.5 px-4 text-slate-500">{inv.issueDate}</td>
                       <td className="py-3.5 px-4 text-center">
@@ -660,7 +660,7 @@ export const PricingInquiriesModule: React.FC = () => {
                   type="button"
                   onClick={() => {
                     const text = encodeURIComponent(
-                      `پیش‌فاکتور رسمی بازرگانی اطلس\nشماره: ${viewInvoice.invoiceNumber}\nمبلغ: ${formatPrice(viewInvoice.total)} تومان\nاعتبار: ${viewInvoice.validUntil}`
+                      `پیش‌فاکتور رسمی بازرگانی اطلس\nشماره: ${viewInvoice.invoiceNumber}\nمبلغ: ${formatPrice(viewInvoice.total ?? viewInvoice.grandTotal ?? 0)} تومان\nاعتبار: ${viewInvoice.validUntil}`
                     );
                     window.open(`https://wa.me/?text=${text}`, '_blank');
                   }}
@@ -773,11 +773,11 @@ export const PricingInquiriesModule: React.FC = () => {
                   </div>
                   <div className="flex items-center justify-between p-2.5 border-b border-slate-200 bg-slate-50">
                     <span className="text-slate-600">مالیات بر ارزش افزوده (۱۰٪):</span>
-                    <span className="font-mono font-bold text-amber-700">{formatPrice(viewInvoice.tax)} تومان</span>
+                    <span className="font-mono font-bold text-amber-700">{formatPrice(viewInvoice.tax ?? viewInvoice.totalTax ?? 0)} تومان</span>
                   </div>
                   <div className="flex items-center justify-between p-3 bg-slate-900 text-white font-black">
                     <span>مبلغ قابل پرداخت:</span>
-                    <span className="font-mono text-sm">{formatPrice(viewInvoice.total)} تومان</span>
+                    <span className="font-mono text-sm">{formatPrice(viewInvoice.total ?? viewInvoice.grandTotal ?? 0)} تومان</span>
                   </div>
                 </div>
               </div>

@@ -76,6 +76,7 @@ interface CartContextType {
   stockOverrides: Record<string, number>;
   // Actions
   addToCart: (product: Product, quantity?: number) => void;
+  addItem: (product: Product, quantity?: number) => void;
   removeFromCart: (productCode: string) => void;
   updateQuantity: (productCode: string, quantity: number) => void;
   saveForLater: (productCode: string) => void;
@@ -573,6 +574,7 @@ export const CartProvider: React.FC<{ children: React.ReactNode }> = ({ children
         selectedShippingId,
         stockOverrides,
         addToCart,
+        addItem: addToCart,
         removeFromCart,
         updateQuantity,
         saveForLater,

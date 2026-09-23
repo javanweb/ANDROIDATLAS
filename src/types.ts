@@ -21,6 +21,8 @@ export interface PriceTiers {
   retail: number;     // خرده‌فروش (قیمت نمایش عمومی)
   wholesale: number;  // پخش / همکار
   dealer: number;     // نمایندگی
+  agency?: number;    // نمایندگی رسمی
+  [key: string]: any;
 }
 
 export interface TechnicalSpec {
@@ -35,13 +37,17 @@ export interface Product {
   brand: string;              // SWR, FORZA, Megadyne, Optibelt, etc.
   categorySlug: string;       // industrial-belts, ceramic-tiles, etc.
   categoryName: string;
+  category?: string;
   subcategory: string;        // V-Belt, Timing, Roller, Filter, etc.
   technicalSpecs: TechnicalSpec[];
   prices: PriceTiers;
   discountPercent?: number;   // درصد تخفیف نمایش عمومی (در صورت وجود)
   stock: number;              // موجودی انبار
   inquiryOnly: boolean;       // وضعیت «فقط استعلامی»
+  isInquiryOnly?: boolean;    // پشتیبانی تکمیلی
+  rating?: number;            // امتیاز کالا
   images: string[];           // SVG Data URIs or optimized SVGs
+  image?: string;             // تصویر پیش‌فرض
   tags: string[];             // e.g. ["پرفروش", "ویژه کاشی", "ضد سایش"]
   minOrderQty?: number;       // حداقل سفارش پخش/نماینده
   unit: string;               // عدد، متر، شاخه، رول، ست
@@ -87,9 +93,12 @@ export interface Customer {
   clubTier: ClubTier;
   clubPoints: number;
   approvedB2B: boolean;
+  assignedPriceListId?: string;
+  assignedGradeId?: string;
   creditLimit?: number;
   discountPercent?: number;
   totalPurchases?: number;
+  totalOrdersAmount?: number;
   notes?: string;
   city: string;
   province: string;
@@ -150,6 +159,7 @@ export interface InquiryItem {
   productName: string;
   quantity: number;
   suggestedPrice?: number;
+  notes?: string;
 }
 
 export interface PriceInquiry {
@@ -243,9 +253,11 @@ export interface PointTransaction {
 
 export interface SmsLog {
   id: string;
-  recipientPhone: string;
-  template:
+  recipientPhone?: string;
+  to?: string;
+  template?:
     | 'order_registered'
+    | 'order_confirmed'
     | 'inquiry_received'
     | 'b2b_approved'
     | 'club_reward'
@@ -254,17 +266,21 @@ export interface SmsLog {
     | 'agency_rejected'
     | 'deposit_received'
     | 'supply_request'
-    | 'custom';
+    | 'custom'
+    | string;
   message: string;
-  status: 'delivered' | 'sent' | 'failed';
-  sentAt: string;
+  status: 'delivered' | 'sent' | 'failed' | string;
+  sentAt?: string;
+  timestamp?: string;
 }
 
 export interface AgencyApplication {
   id: string;
   trackingCode: string;
+  trackingNumber?: string;
   companyName: string;
   managerName: string;
+  fullName?: string;
   nationalCode: string;
   phone: string;
   tel: string;
@@ -274,8 +290,10 @@ export interface AgencyApplication {
   fullAddress: string;
   activityFields: string[]; // e.g. ['کاشی و سرامیک', 'نساجی', 'عمده‌فروشی تسمه', 'تأمین قطعات کارخانجات', 'سایر']
   activityYears: number;
+  experienceYears?: number;
   personnelCount: number;
   monthlyVolume: string; // e.g. 'کمتر از ۵۰ میلیون تومان', '۵۰ تا ۱۰۰ میلیون تومان', ...
+  shopArea?: string | number;
   cooperationType: 'sales_agency' | 'regional_distributor' | 'wholesale_distributor';
   licenseDocument?: {
     fileName: string;
@@ -294,10 +312,11 @@ export interface FinancialTransaction {
   id: string;
   date: string;
   description: string;
-  type: 'invoice' | 'payment' | 'cheque' | 'credit_rebate' | 'return';
+  type: 'invoice' | 'payment' | 'cheque' | 'credit_rebate' | 'return' | string;
   debit: number; // بدهکار (مبلغ فاکتور خرید)
   credit: number; // بستانکار (واریز یا تسویه حساب)
   balance: number; // مانده حساب پس از تراکنش
+  status?: string;
   referenceNumber?: string;
 }
 
@@ -341,6 +360,8 @@ export interface OfficialInvoiceItem {
   row: number;
   productCode: string;
   productName: string;
+  code?: string;
+  name?: string;
   quantity: number;
   unit: string;
   unitPrice: number;
@@ -368,6 +389,7 @@ export interface OfficialInvoice {
   buyer: {
     name: string;
     companyName: string;
+    company?: string;
     nationalId: string;
     economicCode: string;
     phone: string;
@@ -378,7 +400,9 @@ export interface OfficialInvoice {
   subtotal: number;
   totalDiscount: number;
   totalTax: number;
+  tax?: number;
   grandTotal: number;
+  total?: number;
   paymentTerms: string;
   status: 'draft' | 'issued' | 'approved' | 'settled';
 }

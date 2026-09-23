@@ -7,6 +7,7 @@ interface AuthContextType {
   activeRole: UserRole;
   priceLayer: keyof PriceTiers;
   roleTitle: string;
+  isDealer?: boolean;
   isAuthModalOpen: boolean;
   welcomeMessage: string | null;
   openAuthModal: (redirectPath?: string) => void;
@@ -322,6 +323,7 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
         activeRole,
         priceLayer,
         roleTitle: roleTitles[activeRole],
+        isDealer: activeRole === 'dealer',
         isAuthModalOpen,
         welcomeMessage,
         openAuthModal,

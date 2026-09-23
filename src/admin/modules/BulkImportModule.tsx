@@ -696,34 +696,34 @@ export const BulkImportModule: React.FC<BulkImportModuleProps> = ({
             <div className="p-4 rounded-2xl bg-emerald-50 border border-emerald-200">
               <div className="text-xs text-emerald-800 font-bold">کالاهای جدید اضافه شده:</div>
               <div className="text-2xl font-black font-mono text-emerald-700 mt-1">
-                {toPersianDigits(report.newCreated)} کالا
+                {toPersianDigits(report.newCreated ?? report.newCount ?? 0)} کالا
               </div>
             </div>
 
             <div className="p-4 rounded-2xl bg-blue-50 border border-blue-200">
               <div className="text-xs text-blue-800 font-bold">کالاهای به‌روزرسانی شده:</div>
               <div className="text-2xl font-black font-mono text-blue-700 mt-1">
-                {toPersianDigits(report.updated)} کالا
+                {toPersianDigits(report.updated ?? report.updatedCount ?? 0)} کالا
               </div>
             </div>
 
             <div className="p-4 rounded-2xl bg-red-50 border border-red-200">
               <div className="text-xs text-red-800 font-bold">خطاها یا ردهای پردازش:</div>
               <div className="text-2xl font-black font-mono text-red-700 mt-1">
-                {toPersianDigits(report.errorsCount)} ردیف
+                {toPersianDigits(report.errorsCount ?? report.errorCount ?? 0)} ردیف
               </div>
             </div>
           </div>
 
           {/* If Errors */}
-          {report.errorDetails.length > 0 && (
+          {(report.errorDetails || report.errors || []).length > 0 && (
             <div className="max-w-xl mx-auto text-right p-4 rounded-2xl bg-red-50/70 border border-red-200 text-xs text-red-800 space-y-2">
               <div className="font-bold flex items-center gap-1.5">
                 <AlertTriangle className="w-4 h-4 text-red-600" />
                 <span>ردیف‌های دارای خطا که رد شدند:</span>
               </div>
               <div className="space-y-1">
-                {report.errorDetails.map((err, i) => (
+                {(report.errorDetails || report.errors || []).map((err: any, i: number) => (
                   <div key={i} className="text-[11px] font-mono">
                     ردیف {toPersianDigits(err.row)} (کد: {err.code || 'خالی'}): {err.message}
                   </div>

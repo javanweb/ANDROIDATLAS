@@ -29,6 +29,10 @@ import {
   Wrench,
   Phone,
   MessageCircle,
+  Scan,
+  Target,
+  Cpu,
+  Activity,
 } from 'lucide-react';
 import { Modal } from '../ui/Modal';
 import {
@@ -51,6 +55,45 @@ interface Props {
 
 type WizardStep = 1 | 2 | 3 | 'analyzing' | 'results';
 
+interface AnalysisPhase {
+  title: string;
+  en: string;
+  icon: React.ElementType;
+  tag: string;
+  detail: string;
+}
+
+const ANALYSIS_PHASES: AnalysisPhase[] = [
+  {
+    title: 'اسکن هندسه مقطع و دندانه‌ها',
+    en: 'GEOMETRY SCAN',
+    icon: Scan,
+    tag: 'هندسه و مقطع',
+    detail: 'بررسی عمق و زاویه شیار',
+  },
+  {
+    title: 'محاسبه گام و ابعاد استاندارد',
+    en: 'PITCH & DIMENSIONS',
+    icon: Ruler,
+    tag: 'گام و ابعاد',
+    detail: 'اندازه‌گیری گام برحسب میلیمتر',
+  },
+  {
+    title: 'تشخیص ساختار و نوع متریال',
+    en: 'MATERIAL IDENTIFICATION',
+    icon: Layers,
+    tag: 'نوع متریال',
+    detail: 'تشخیص پلی‌یورتان یا لاستیک',
+  },
+  {
+    title: 'انطباق با کاتالوگ قطعات اطلس',
+    en: 'CATALOG MATCHING',
+    icon: Cpu,
+    tag: 'کاتالوگ اطلس',
+    detail: 'بررسی موجودی و کدهای معادل',
+  },
+];
+
 export const AiVisualPartSearchModal: React.FC<Props> = ({ isOpen, onClose }) => {
   const navigate = useNavigate();
   const { addItem } = useCart();
@@ -63,6 +106,29 @@ export const AiVisualPartSearchModal: React.FC<Props> = ({ isOpen, onClose }) =>
   const [selectedImage, setSelectedImage] = useState<string | null>(null);
   const [mimeType, setMimeType] = useState<string>('image/jpeg');
   const [length, setLength] = useState<string>('');
+
+  // Dynamic scanning simulation state while analyzing
+  const [analysisProgress, setAnalysisProgress] = useState<number>(18);
+  const [analysisPhaseIndex, setAnalysisPhaseIndex] = useState<number>(0);
+
+  React.useEffect(() => {
+    if (currentStep !== 'analyzing') {
+      setAnalysisProgress(18);
+      setAnalysisPhaseIndex(0);
+      return;
+    }
+
+    const interval = setInterval(() => {
+      setAnalysisProgress(prev => {
+        if (prev >= 94) return 94;
+        const jump = Math.floor(Math.random() * 7) + 5;
+        return Math.min(prev + jump, 94);
+      });
+      setAnalysisPhaseIndex(prev => (prev + 1) % ANALYSIS_PHASES.length);
+    }, 1000);
+
+    return () => clearInterval(interval);
+  }, [currentStep]);
   const [width, setWidth] = useState<string>('');
   const [pitch, setPitch] = useState<string>('');
   const [application, setApplication] = useState<string>('');
@@ -288,7 +354,7 @@ export const AiVisualPartSearchModal: React.FC<Props> = ({ isOpen, onClose }) =>
         onClose();
       }}
       title="شناسایی هوشمند قطعه و تسمه با هوش مصنوعی"
-      maxWidth="lg"
+      maxWidth={currentStep === 'analyzing' || currentStep === 'results' ? 'xl' : 'lg'}
     >
       <div className="text-right space-y-5">
         {/* TOP STEPPER (Only visible during steps 1, 2, 3) */}
@@ -500,7 +566,7 @@ export const AiVisualPartSearchModal: React.FC<Props> = ({ isOpen, onClose }) =>
                 <div className="bg-slate-50 border border-slate-200 rounded-2xl p-4 flex flex-col sm:flex-row items-center gap-4">
                   <div className="w-full sm:w-44 h-36 rounded-xl overflow-hidden bg-slate-900 border border-slate-200 relative shrink-0">
                     <img
-                      src={selectedImage}
+                      src={selectedImage || undefined}
                       alt="قطعه انتخابی"
                       className="w-full h-full object-contain"
                     />
@@ -901,7 +967,7 @@ export const AiVisualPartSearchModal: React.FC<Props> = ({ isOpen, onClose }) =>
           )}
 
           {/* ============================================================ */}
-          {/* STEP: ANALYZING STATE                                        */}
+          {/* STEP: ANALYZING STATE (Bright, Delightful Studio Scanner)    */}
           {/* ============================================================ */}
           {currentStep === 'analyzing' && (
             <motion.div
@@ -909,31 +975,157 @@ export const AiVisualPartSearchModal: React.FC<Props> = ({ isOpen, onClose }) =>
               initial={{ opacity: 0, scale: 0.98 }}
               animate={{ opacity: 1, scale: 1 }}
               exit={{ opacity: 0, scale: 0.98 }}
-              className="py-14 flex flex-col items-center justify-center text-center space-y-4"
+              transition={{ duration: 0.2 }}
+              className="space-y-4"
             >
-              <div className="relative">
-                <div className="w-16 h-16 rounded-2xl bg-orange-100 flex items-center justify-center text-[#F97316] animate-pulse">
-                  <Sparkles className="w-8 h-8" />
+              {/* IMAGE VIEWPORT CONTAINER (Bright Studio Frame) */}
+              <div className="relative w-full rounded-2xl sm:rounded-3xl overflow-hidden bg-white border border-slate-200/90 shadow-lg shadow-slate-200/50">
+                {/* Clean Delightful Top Header */}
+                <div className="relative z-30 px-4 sm:px-6 py-3.5 flex items-center justify-between border-b border-slate-100 bg-white/95 backdrop-blur-sm">
+                  <div className="flex items-center gap-2.5">
+                    <span className="relative flex h-2.5 w-2.5">
+                      <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75"></span>
+                      <span className="relative inline-flex rounded-full h-2.5 w-2.5 bg-emerald-500"></span>
+                    </span>
+                    <span className="text-xs sm:text-sm font-bold text-[#0A172F]">
+                      شناسایی و آنالیز هوشمند قطعه
+                    </span>
+                    <span className="hidden sm:inline text-slate-300">|</span>
+                    <span className="hidden sm:inline text-[11px] text-slate-400">
+                      پردازش ابعاد و متریال
+                    </span>
+                  </div>
+
+                  <div className="flex items-center gap-2">
+                    <div className="px-3 py-1 rounded-full bg-orange-50 border border-orange-200/80 text-[#EA580C] text-xs font-bold font-mono shadow-2xs">
+                      {toPersianDigits(analysisProgress)}٪ در حال بررسی
+                    </div>
+                  </div>
                 </div>
-                <div className="absolute -inset-1 border-2 border-[#F97316] border-t-transparent rounded-2xl animate-spin" />
-              </div>
 
-              <div className="space-y-1.5 max-w-sm">
-                <h4 className="text-base font-black text-[#0A172F]">
-                  {pendingStage === 'quick'
-                    ? 'در حال شناسایی قطعه از روی تصویر...'
-                    : 'در حال تحلیل دقیق و انطباق با کاتالوگ ۸۶۴ قلمی اطلس'}
-                </h4>
-                <p className="text-xs text-slate-500 leading-relaxed">
-                  {pendingStage === 'quick'
-                    ? 'هوش مصنوعی در حال بررسی هندسه، دندانه‌ها، متریال و نوع قطعه در تصویر شماست...'
-                    : `هوش مصنوعی در حال بررسی هندسه دندانه‌ها، زاویه مقطع، ابعاد ${length ? `${length}mm` : ''} و انطباق با نیاز شماست...`}
-                </p>
-              </div>
+                {/* THE IMAGE DISPLAY & VIBRANT LASER LINE */}
+                <div className="relative w-full h-72 sm:h-84 md:h-96 flex items-center justify-center overflow-hidden bg-gradient-to-b from-slate-50/80 via-white to-orange-50/20 select-none">
+                  {/* Subtle Light Blueprint Dot Grid */}
+                  <div
+                    className="absolute inset-0 opacity-40 pointer-events-none"
+                    style={{
+                      backgroundImage: 'radial-gradient(#94a3b8 1px, transparent 1px)',
+                      backgroundSize: '24px 24px',
+                    }}
+                  />
 
-              <div className="flex items-center gap-2 text-xs text-emerald-600 font-medium pt-2">
-                <span className="w-2 h-2 rounded-full bg-emerald-500 animate-ping" />
-                <span>پردازش بلادرنگ هوش مصنوعی</span>
+                  {/* Soft Warm Radial Aura */}
+                  <div className="absolute w-[420px] h-[420px] rounded-full bg-gradient-to-tr from-orange-200/25 via-amber-100/20 to-transparent pointer-events-none blur-2xl" />
+
+                  {/* Elegant Corner Framing Brackets */}
+                  <div className="absolute top-4 right-4 w-5 h-5 border-t-2 border-r-2 border-orange-400/70 rounded-tr-md pointer-events-none z-10" />
+                  <div className="absolute top-4 left-4 w-5 h-5 border-t-2 border-l-2 border-orange-400/70 rounded-tl-md pointer-events-none z-10" />
+                  <div className="absolute bottom-4 right-4 w-5 h-5 border-b-2 border-r-2 border-orange-400/70 rounded-br-md pointer-events-none z-10" />
+                  <div className="absolute bottom-4 left-4 w-5 h-5 border-b-2 border-l-2 border-orange-400/70 rounded-bl-md pointer-events-none z-10" />
+
+                  {/* The uploaded part image (blends smoothly on light background) */}
+                  {selectedImage ? (
+                    <img
+                      src={selectedImage}
+                      alt="قطعه صنعتی در حال آنالیز"
+                      className="max-h-full max-w-full object-contain relative z-10 p-6 drop-shadow-md"
+                    />
+                  ) : (
+                    <div className="relative z-10 flex flex-col items-center justify-center text-center p-6 space-y-3">
+                      <div className="w-16 h-16 rounded-2xl bg-orange-50 border border-orange-200 flex items-center justify-center shadow-xs">
+                        <Cpu className="w-8 h-8 text-[#F97316] animate-pulse" />
+                      </div>
+                      <span className="text-xs font-bold text-slate-700">
+                        در حال انطباق بر اساس مشخصات ابعادی
+                      </span>
+                    </div>
+                  )}
+
+                  {/* ENERGETIC, VIBRANT LASER SCANNER LINE */}
+                  <motion.div
+                    className="absolute left-0 right-0 z-20 pointer-events-none"
+                    animate={{
+                      top: ['3%', '95%', '3%'],
+                    }}
+                    transition={{
+                      duration: 2.8,
+                      repeat: Infinity,
+                      ease: 'easeInOut',
+                    }}
+                  >
+                    {/* Warm light wash trailing above laser */}
+                    <div className="h-20 -mt-20 w-full bg-gradient-to-b from-transparent via-orange-400/10 to-orange-500/25 pointer-events-none" />
+
+                    {/* Crisp glowing laser beam line */}
+                    <div className="relative h-[2.5px] w-full bg-gradient-to-r from-transparent via-[#F97316] via-amber-400 to-transparent shadow-[0_0_14px_3px_rgba(249,115,22,0.45)]" />
+
+                    {/* Center floating scan badge */}
+                    <div className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 flex items-center gap-1.5 px-3.5 py-1 rounded-full bg-white/95 border border-orange-200/90 text-[10px] font-bold text-[#EA580C] shadow-sm backdrop-blur-md whitespace-nowrap">
+                      <span className="w-1.5 h-1.5 rounded-full bg-[#F97316] animate-pulse" />
+                      <span>اسکن نوری و هندسی</span>
+                    </div>
+                  </motion.div>
+                </div>
+
+                {/* Shimmering Progress Bar */}
+                <div className="w-full h-1.5 bg-slate-100 overflow-hidden">
+                  <motion.div
+                    className="h-full bg-gradient-to-r from-orange-400 via-amber-400 to-emerald-500"
+                    style={{ width: `${analysisProgress}%` }}
+                    transition={{ ease: 'easeOut', duration: 0.3 }}
+                  />
+                </div>
+
+                {/* Delightful Bottom Status Section */}
+                <div className="p-4 sm:p-5 bg-white border-t border-slate-100 space-y-3.5">
+                  <div className="flex items-center justify-between text-xs">
+                    <span className="text-[#0A172F] font-bold flex items-center gap-2 text-xs sm:text-sm">
+                      <Sparkles className="w-4 h-4 text-[#F97316]" />
+                      <span>{ANALYSIS_PHASES[analysisPhaseIndex].title}</span>
+                    </span>
+                    <span className="text-slate-500 text-[11px] font-medium bg-slate-50 px-2 py-0.5 rounded-md border border-slate-200/60">
+                      مرحله {toPersianDigits(analysisPhaseIndex + 1)} از ۴
+                    </span>
+                  </div>
+
+                  {/* 4 Fresh Delightful Step Badges */}
+                  <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
+                    {ANALYSIS_PHASES.map((phase, idx) => {
+                      const isCurrent = idx === analysisPhaseIndex;
+                      const isDone = idx < analysisPhaseIndex;
+
+                      return (
+                        <div
+                          key={idx}
+                          className={`px-3 py-2.5 rounded-xl text-center transition-all text-xs flex items-center justify-center gap-1.5 border ${
+                            isCurrent
+                              ? 'bg-orange-50 text-[#EA580C] font-bold border-orange-300 shadow-xs'
+                              : isDone
+                              ? 'bg-emerald-50 text-emerald-700 font-semibold border-emerald-200'
+                              : 'bg-slate-50/70 text-slate-500 border-slate-200/70'
+                          }`}
+                        >
+                          {isDone ? (
+                            <Check className="w-3.5 h-3.5 text-emerald-600 shrink-0" />
+                          ) : isCurrent ? (
+                            <span className="w-2 h-2 rounded-full bg-[#F97316] animate-pulse shrink-0" />
+                          ) : (
+                            <span className="w-1.5 h-1.5 rounded-full bg-slate-300 shrink-0" />
+                          )}
+                          <span className="truncate">{phase.tag}</span>
+                        </div>
+                      );
+                    })}
+                  </div>
+
+                  {/* Reassuring Friendly Note */}
+                  <div className="pt-1 flex items-center justify-center gap-2 text-xs text-slate-500">
+                    <CheckCircle2 className="w-4 h-4 text-emerald-500 shrink-0" />
+                    <span>
+                      در حال تطبیق هوشمند با کاتالوگ جامع ۸۶۴ قلمی قطعات و تسمه‌های صنعتی بازرگانی اطلس
+                    </span>
+                  </div>
+                </div>
               </div>
             </motion.div>
           )}
