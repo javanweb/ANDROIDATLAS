@@ -52,11 +52,14 @@ jobs:
           node-version: '22'
           cache: npm
 
-      - name: Set up JDK 17
+      # Capacitor's generated capacitor.build.gradle compiles with
+      # sourceCompatibility/targetCompatibility = VERSION_21, so the build
+      # needs a JDK 21 toolchain (AGP 8.13 also requires 17+).
+      - name: Set up JDK 21
         uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: '17'
+          java-version: '21'
 
       - name: Install required Android SDK components
         run: |
