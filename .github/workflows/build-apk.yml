@@ -82,8 +82,13 @@ jobs:
           [ -z "$VERSION_NAME" ] && VERSION_NAME="${{ vars.APK_VERSION_NAME }}"
           [ -z "$VERSION_NAME" ] && VERSION_NAME="1.0.0"
 
+          # Android's versionCode is a 32-bit int, so the run number (which can
+          # be much larger) is reduced modulo 2e9 to stay in range.
+          RUN_NUMBER="${{ github.run_number }}"
           VERSION_CODE="${{ vars.APK_VERSION_CODE }}"
-          [ -z "$VERSION_CODE" ] && VERSION_CODE="${{ github.run_number }}"
+          if [ -z "$VERSION_CODE" ]; then
+            VERSION_CODE=$(( RUN_NUMBER % 2000000000 ))
+          fi
 
           API_BASE="${{ inputs.api_base_url }}"
           [ -z "$API_BASE" ] && API_BASE="${{ vars.VITE_API_BASE_URL }}"
