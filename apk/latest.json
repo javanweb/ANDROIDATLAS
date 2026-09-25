@@ -2,12 +2,12 @@
   "app": "هایپر صنعت اطلس",
   "package": "ir.javanweb.hyperatlas",
   "versionName": "1.0.0",
-  "versionCode": 3,
+  "versionCode": 4,
   "signedWith": "debug key",
-  "sizeBytes": 33180551,
-  "sha256": "86e81357c2f2bcde441c6ef3b871d88b091d81fc3c578f09389f4a2cdbb5bdd0",
-  "builtAt": "2026-09-25T19:49:50Z",
-  "commit": "9b0452e",
-  "runUrl": "https://github.com/javanweb/ANDROIDATLAS/actions/runs/36181591844",
+  "sizeBytes": 8271940,
+  "sha256": "07b758bf6d657901eb4404c13dc278a1f55e9b88141cf9a62b70abd9134e8e68",
+  "builtAt": "2026-09-25T20:14:48Z",
+  "commit": "54477df",
+  "runUrl": "https://github.com/javanweb/ANDROIDATLAS/actions/runs/36184388940",
   "apkUrl": "https://github.com/javanweb/ANDROIDATLAS/raw/main/apk/hyperatlas-latest.apk"
 }
