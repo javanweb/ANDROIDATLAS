@@ -14,6 +14,7 @@ import {
 } from 'lucide-react';
 import { Modal } from '../ui/Modal';
 import { STORE_ASSETS } from '../../assets/images';
+import { apiUrl } from '../../config/apiConfig';
 
 interface Props {
   isOpen: boolean;
@@ -64,7 +65,7 @@ export const AiConsultModal: React.FC<Props> = ({ isOpen, onClose }) => {
 
     try {
       // Send to server Gemini API if available, or generate smart industrial response
-      const res = await fetch('/api/ai/consult', {
+      const res = await fetch(apiUrl('/api/ai/consult'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ query: textToSend }),

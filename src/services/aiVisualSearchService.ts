@@ -1,6 +1,7 @@
 import { Product } from '../types';
 import { getProductByCode, generateMockProducts } from '../data/mockGenerator';
 import { getProductImageUrl } from '../assets/imagesproducts';
+import { apiUrl, assertBackendConfigured } from '../config/apiConfig';
 
 // مرحله تحلیل:
 // quick   = شناسایی فوری فقط از روی تصویر (مرحله اول)
@@ -155,7 +156,9 @@ export const aiVisualSearchService = {
       mimeType = converted.mimeType;
     }
 
-    const response = await fetch('/api/ai/analyze-part', {
+    assertBackendConfigured();
+
+    const response = await fetch(apiUrl('/api/ai/analyze-part'), {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',

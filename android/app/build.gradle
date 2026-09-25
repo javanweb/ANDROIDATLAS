@@ -1,0 +1,100 @@
+apply plugin: 'com.android.application'
+
+// ---------------------------------------------------------------------------
+// Release signing
+// ---------------------------------------------------------------------------
+// Signing material can be supplied in two ways:
+//   1. android/keystore.properties  -> local development (git-ignored)
+//   2. environment variables         -> CI / GitHub Actions secrets
+//
+// When neither is present the release build falls back to the debug key so the
+// APK is always installable. Supply a real upload keystore before publishing
+// to Google Play (see apk/README.md).
+def keystorePropertiesFile = rootProject.file('keystore.properties')
+def keystoreProperties = new Properties()
+if (keystorePropertiesFile.exists()) {
+    keystorePropertiesFile.withInputStream { keystoreProperties.load(it) }
+}
+
+def ksPath        = keystoreProperties.getProperty('storeFile')     ?: System.getenv('ANDROID_KEYSTORE_PATH')
+def ksPassword    = keystoreProperties.getProperty('storePassword') ?: System.getenv('ANDROID_KEYSTORE_PASSWORD')
+def ksAlias       = keystoreProperties.getProperty('keyAlias')      ?: System.getenv('ANDROID_KEY_ALIAS')
+def ksKeyPassword = keystoreProperties.getProperty('keyPassword')   ?: System.getenv('ANDROID_KEY_PASSWORD')
+
+def hasReleaseKeystore = ksPath && ksPassword && ksAlias && ksKeyPassword && file(ksPath).exists()
+
+if (hasReleaseKeystore) {
+    logger.lifecycle("Signing release build with keystore: ${ksPath}")
+} else {
+    logger.lifecycle("No release keystore found - signing release build with the debug key.")
+}
+
+android {
+    namespace = "ir.javanweb.hyperatlas"
+    compileSdk = rootProject.ext.compileSdkVersion
+    defaultConfig {
+        applicationId "ir.javanweb.hyperatlas"
+        minSdkVersion rootProject.ext.minSdkVersion
+        targetSdkVersion rootProject.ext.targetSdkVersion
+        // Overridable from CI so every published build gets a fresh version.
+        versionCode (System.getenv("APK_VERSION_CODE") ?: "1").toInteger()
+        versionName System.getenv("APK_VERSION_NAME") ?: "1.0.0"
+        testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
+        aaptOptions {
+             // Files and dirs to omit from the packaged assets dir, modified to accommodate modern web apps.
+             // Default: https://android.googlesource.com/platform/frameworks/base/+/282e181b58cf72b6ca770dc7ca5f91f135444502/tools/aapt/AaptAssets.cpp#61
+            ignoreAssetsPattern = '!.svn:!.git:!.ds_store:!*.scc:.*:!CVS:!thumbs.db:!picasa.ini:!*~'
+            // The web assets are already WebP/compressed - do not re-compress them.
+            noCompress 'webp'
+        }
+    }
+
+    signingConfigs {
+        if (hasReleaseKeystore) {
+            release {
+                storeFile file(ksPath)
+                storePassword ksPassword
+                keyAlias ksAlias
+                keyPassword ksKeyPassword
+            }
+        }
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false
+            proguardFiles getDefaultProguardFile('proguard-android.txt'), 'proguard-rules.pro'
+            // Always produce an installable APK, even without a real keystore.
+            signingConfig hasReleaseKeystore ? signingConfigs.release : signingConfigs.debug
+        }
+    }
+}
+
+repositories {
+    flatDir{
+        dirs '../capacitor-cordova-android-plugins/src/main/libs', 'libs'
+    }
+}
+
+dependencies {
+    implementation fileTree(include: ['*.jar'], dirs: 'libs')
+    implementation "androidx.appcompat:appcompat:$androidxAppCompatVersion"
+    implementation "androidx.coordinatorlayout:coordinatorlayout:$androidxCoordinatorLayoutVersion"
+    implementation "androidx.core:core-splashscreen:$coreSplashScreenVersion"
+    implementation project(':capacitor-android')
+    testImplementation "junit:junit:$junitVersion"
+    androidTestImplementation "androidx.test.ext:junit:$androidxJunitVersion"
+    androidTestImplementation "androidx.test.espresso:espresso-core:$androidxEspressoCoreVersion"
+    implementation project(':capacitor-cordova-android-plugins')
+}
+
+apply from: 'capacitor.build.gradle'
+
+try {
+    def servicesJSON = file('google-services.json')
+    if (servicesJSON.text) {
+        apply plugin: 'com.google.gms.google-services'
+    }
+} catch(Exception e) {
+    logger.info("google-services.json not found, google-services plugin not applied. Push Notifications won't work")
+}
