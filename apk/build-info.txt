@@ -1,0 +1,13 @@
+هایپر صنعت اطلس — Android APK
+==============================
+
+فایل APK        : apk/hyperatlas-v1.0.0.apk
+آخرین نسخه      : apk/hyperatlas-latest.apk
+نسخه            : 1.0.0 (versionCode 3)
+شناسه اپ         : ir.javanweb.hyperatlas
+امضا            : debug key
+حجم             : 32M
+SHA-256         : 86e81357c2f2bcde441c6ef3b871d88b091d81fc3c578f09389f4a2cdbb5bdd0
+تاریخ ساخت       : 2026-09-25 19:49:50 UTC
+کامیت سورس       : 9b0452e
+لینک اجرای ساخت   : https://github.com/javanweb/ANDROIDATLAS/actions/runs/36181591844
