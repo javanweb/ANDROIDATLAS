@@ -160,7 +160,13 @@ try {
 // ============================================================================
 
 const IMAGE_HASH_CACHE_PATH = path.join(process.cwd(), 'src', 'data', 'imageHashes.json');
-const CATALOG_IMAGES_DIR = path.join(process.cwd(), 'src', 'assets', 'imagesproducts');
+const GITHUB_CATALOG_IMAGES_REPO = 'https://raw.githubusercontent.com/javanweb/imagesatlas/main';
+const CATALOG_IMAGES_CACHE_DIR = path.join(process.cwd(), '.cache', 'catalog_images');
+
+// Ensure catalog images cache folder exists
+try {
+  fs.mkdirSync(CATALOG_IMAGES_CACHE_DIR, { recursive: true });
+} catch {}
 
 // Pure-visual multi-feature descriptor per catalog image.
 // NOTE: product names/codes in the current catalog data are known to be
@@ -319,14 +325,10 @@ async function buildImageEmbeddingIndex(): Promise<void> {
             const bufs: Buffer[] = [];
             for (const item of missing) {
               const file = (item.image || '').trim();
-              const fullPath = resolveCatalogImagePath(file);
-              if (!fullPath) continue;
-              try {
-                bufs.push(fs.readFileSync(fullPath));
-                files.push(file);
-              } catch {
-                // unreadable
-              }
+              const buf = await getCatalogImageBuffer(file);
+              if (!buf) continue;
+              bufs.push(buf);
+              files.push(file);
             }
             const embeddings = await jinaEmbedImages(bufs, 'retrieval.passage');
             let built = 0;
@@ -366,38 +368,66 @@ async function buildImageEmbeddingIndex(): Promise<void> {
 const CATALOG_IMAGE_ALIASES = new Map<string, string>();
 
 function buildCatalogImageAliases(): void {
-  try {
-    const files = fs.readdirSync(CATALOG_IMAGES_DIR);
-    for (const f of files) {
-      const lower = f.toLowerCase();
-      CATALOG_IMAGE_ALIASES.set(lower, f);
-      const m = lower.match(/^e\(?(\d+)\)?\.(png|jpe?g|webp)$/i);
-      if (m) {
-        const num = parseInt(m[1], 10);
-        const ext = m[2];
-        for (const pad of [2, 3]) {
-          const variant = `e(${String(num).padStart(pad, '0')}).${ext}`;
-          if (!CATALOG_IMAGE_ALIASES.has(variant)) {
-            CATALOG_IMAGE_ALIASES.set(variant, f);
-          }
-        }
-      }
+  for (let num = 1; num <= 869; num++) {
+    const raw = `e(${num}).png`;
+    CATALOG_IMAGE_ALIASES.set(raw.toLowerCase(), raw);
+    for (const pad of [2, 3]) {
+      const variant = `e(${String(num).padStart(pad, '0')}).png`;
+      CATALOG_IMAGE_ALIASES.set(variant.toLowerCase(), raw);
     }
-    console.log(`[Server] Catalog image alias map: ${CATALOG_IMAGE_ALIASES.size} entries.`);
-  } catch {
-    // best-effort only
+    CATALOG_IMAGE_ALIASES.set(`e${num}.png`, raw);
+    CATALOG_IMAGE_ALIASES.set(`at-e${num}`, raw);
+    CATALOG_IMAGE_ALIASES.set(`at-e${String(num).padStart(3, '0')}`, raw);
   }
+  console.log(`[Server] Catalog image alias map initialized with ${CATALOG_IMAGE_ALIASES.size} entries.`);
+}
+
+function normalizeCatalogImageFilename(image?: string): string {
+  const clean = (image || '').trim().toLowerCase();
+  if (!clean) return 'e(1).png';
+  if (CATALOG_IMAGE_ALIASES.has(clean)) {
+    return CATALOG_IMAGE_ALIASES.get(clean)!;
+  }
+  const m = clean.match(/(?:e\(?|at-e)?(\d+)\)?(?:\.(png|jpe?g|webp|svg))?/i);
+  if (m) {
+    const num = parseInt(m[1], 10);
+    const normalizedNum = ((Math.abs(num) - 1) % 869) + 1;
+    return `e(${normalizedNum}).png`;
+  }
+  return clean.endsWith('.png') ? clean : `${clean}.png`;
 }
 
 function resolveCatalogImagePath(image?: string): string | null {
-  const clean = (image || '').trim().toLowerCase();
-  if (!clean) return null;
-  const direct = path.join(CATALOG_IMAGES_DIR, clean);
-  if (fs.existsSync(direct)) return direct;
-  const aliased = CATALOG_IMAGE_ALIASES.get(clean);
-  if (aliased) {
-    const p = path.join(CATALOG_IMAGES_DIR, aliased);
-    if (fs.existsSync(p)) return p;
+  const filename = normalizeCatalogImageFilename(image);
+  const cached = path.join(CATALOG_IMAGES_CACHE_DIR, filename);
+  if (fs.existsSync(cached)) return cached;
+  return null;
+}
+
+async function getCatalogImageBuffer(image?: string): Promise<Buffer | null> {
+  const filename = normalizeCatalogImageFilename(image);
+  const cachedPath = path.join(CATALOG_IMAGES_CACHE_DIR, filename);
+
+  if (fs.existsSync(cachedPath)) {
+    try {
+      return fs.readFileSync(cachedPath);
+    } catch {}
+  }
+
+  // Fetch directly from GitHub repository javanweb/imagesatlas
+  try {
+    const url = `${GITHUB_CATALOG_IMAGES_REPO}/${encodeURIComponent(filename)}`;
+    const res = await fetch(url);
+    if (res.ok) {
+      const arr = await res.arrayBuffer();
+      const buf = Buffer.from(arr);
+      try {
+        fs.writeFileSync(cachedPath, buf);
+      } catch {}
+      return buf;
+    }
+  } catch (err) {
+    console.warn(`[Server] Failed to fetch catalog image ${filename} from GitHub:`, err);
   }
   return null;
 }
@@ -678,10 +708,9 @@ async function buildImageFeatureIndex(): Promise<void> {
     for (const item of CATALOG_ITEMS) {
       const file = (item.image || '').trim();
       if (!file || IMAGE_FEATURE_INDEX.has(file)) continue;
-      const fullPath = resolveCatalogImagePath(file);
-      if (!fullPath) continue;
+      const buf = await getCatalogImageBuffer(file);
+      if (!buf) continue;
       try {
-        const buf = fs.readFileSync(fullPath);
         IMAGE_FEATURE_INDEX.set(file, await computeDualImageFeatures(buf));
         newlyHashed++;
       } catch {
@@ -1296,10 +1325,10 @@ async function renderMontageGrid(refs: RankedItemRef[]): Promise<Buffer> {
     const row = Math.floor(i / MONTAGE_GRID_COLS);
     const x = col * MONTAGE_CELL_PX;
     const y = row * MONTAGE_CELL_PX;
-    const imgPath = resolveCatalogImagePath(refs[i].image);
-    if (imgPath) {
+    const imgBuf = await getCatalogImageBuffer(refs[i].image);
+    if (imgBuf) {
       try {
-        const thumb = await sharp(imgPath)
+        const thumb = await sharp(imgBuf)
           .resize(MONTAGE_CELL_PX - 2, MONTAGE_CELL_PX - 2, { fit: 'inside' })
           .flatten({ background: '#ffffff' })
           .png()
@@ -1487,10 +1516,10 @@ async function verifyCandidatesVisually(
     // 3. Load + resize candidate images (aliases resolved)
     const prepared: { cand: any; jpg: Buffer }[] = [];
     for (const cand of uniqueCandidates) {
-      const imgPath = resolveCatalogImagePath(cand.image);
-      if (!imgPath) continue;
+      const candBuf = await getCatalogImageBuffer(cand.image);
+      if (!candBuf) continue;
       try {
-        const candJpg = await sharp(imgPath)
+        const candJpg = await sharp(candBuf)
           .resize(440, 440, { fit: 'inside' })
           .jpeg({ quality: 82 })
           .toBuffer();
